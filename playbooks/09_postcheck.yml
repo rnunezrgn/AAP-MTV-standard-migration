@@ -27,6 +27,23 @@
       ansible.builtin.set_fact:
         mtv_post_vms: "{{ mtv_stage_vms }}"
 
+    - name: Record that the in-guest post-checks were skipped
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: record
+      vars:
+        ev_stage: postcheck
+        ev_vm: "{{ _vm }}"
+        ev_checks:
+          - id: guest_checks
+            title: In-guest post-checks
+            status: warn
+            detail: "Skipped: mtv_guest_checks is false. Drivers, VMware cleanup and BitLocker were not checked in the guest."
+      loop: "{{ mtv_post_vms }}"
+      loop_control:
+        loop_var: _vm
+      when: not (mtv_guest_checks | bool)
+
 - name: "09 | Post-check | Windows guests"
   hosts: windows_guests
   gather_facts: false
@@ -36,7 +53,8 @@
     - name: Only migrated Windows VMs
       ansible.builtin.meta: end_host
       when: >-
-        mtv_vm not in hostvars['localhost'].mtv_post_vms | default([])
+        not (mtv_guest_checks | bool)
+        or mtv_vm not in hostvars['localhost'].mtv_post_vms | default([])
         or mtv_vm not in hostvars['localhost'].mtv_eligible_windows | default([])
 
     - name: Windows post-check
@@ -53,7 +71,8 @@
     - name: Only migrated Linux VMs
       ansible.builtin.meta: end_host
       when: >-
-        mtv_vm not in hostvars['localhost'].mtv_post_vms | default([])
+        not (mtv_guest_checks | bool)
+        or mtv_vm not in hostvars['localhost'].mtv_post_vms | default([])
         or mtv_vm not in hostvars['localhost'].mtv_eligible_linux | default([])
 
     - name: Linux post-check

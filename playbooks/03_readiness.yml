@@ -12,6 +12,23 @@
         name: mtv_common
         tasks_from: load_run
 
+    - name: Record that the in-guest readiness checks were skipped
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: record
+      vars:
+        ev_stage: readiness
+        ev_vm: "{{ _vm }}"
+        ev_checks:
+          - id: guest_checks
+            title: In-guest readiness checks
+            status: warn
+            detail: "Skipped: mtv_guest_checks is false. VirtIO, BitLocker and guest configuration were not checked."
+      loop: "{{ mtv_eligible_windows + mtv_eligible_linux }}"
+      loop_control:
+        loop_var: _vm
+      when: not (mtv_guest_checks | bool)
+
 - name: "03 | Readiness | Windows guests"
   hosts: windows_guests
   gather_facts: false
@@ -20,7 +37,7 @@
   tasks:
     - name: Only this run's eligible Windows VMs
       ansible.builtin.meta: end_host
-      when: mtv_vm not in hostvars['localhost'].mtv_eligible_windows | default([])
+      when: not (mtv_guest_checks | bool) or mtv_vm not in hostvars['localhost'].mtv_eligible_windows | default([])
 
     - name: Windows readiness
       ansible.builtin.include_role:
@@ -35,7 +52,7 @@
   tasks:
     - name: Only this run's eligible Linux VMs
       ansible.builtin.meta: end_host
-      when: mtv_vm not in hostvars['localhost'].mtv_eligible_linux | default([])
+      when: not (mtv_guest_checks | bool) or mtv_vm not in hostvars['localhost'].mtv_eligible_linux | default([])
 
     - name: Linux readiness
       ansible.builtin.include_role:

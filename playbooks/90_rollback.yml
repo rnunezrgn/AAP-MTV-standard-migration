@@ -18,7 +18,7 @@
   tasks:
     - name: Only rolled-back VMs
       ansible.builtin.meta: end_host
-      when: mtv_vm not in hostvars['localhost'].mtv_rollback | default([]) | map(attribute='vm') | list
+      when: not (mtv_guest_checks | bool) or mtv_vm not in hostvars['localhost'].mtv_rollback | default([]) | map(attribute='vm') | list
 
     - name: Resume BitLocker
       ansible.builtin.include_role:

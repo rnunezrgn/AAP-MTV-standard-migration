@@ -84,4 +84,32 @@ plan_cr = {"metadata": {"name": "p1"}, "spec": {"warm": True, "vms": [{"id": "vm
 assert mtv.mtv_planned_vms([plan_cr]) == [{"vm": "win2022-app01", "moid": "vm-101", "plan": "p1", "warm": True}]
 oc = mtv.mtv_plan_vm_outcomes([plan_cr]); assert oc[0]["ok"] and oc[0]["checks"][2]["detail"] == "3 ok, 0 failed"
 assert mtv.mtv_ref({"vm": "a", "moid": "vm-1"}) == {"name": "a", "id": "vm-1"}
+
+# Distributed port groups: resolved by name, referenced by id in the NetworkMap
+def dvnic(key, mac): return {"_vimtype": "vim.vm.device.VirtualVmxnet3", "macAddress": mac, "deviceInfo": {"label": "Network adapter 1"},
+    "backing": {"_vimtype": "vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo", "port": {"portgroupKey": key, "switchUuid": "50 2a"}}}
+pgs = mtv.mtv_portgroups({"dvs_portgroup_info": {"dvs1": [{"key": "dvportgroup-210", "portgroup_name": "segment-migrating-to-ocpvirt"}]}})
+assert pgs == {"dvportgroup-210": "segment-migrating-to-ocpvirt"}
+assert mtv.mtv_portgroups({"failed": True, "msg": "no permission"}) == {}
+sd, dd = vm("haproxy", "vm-201", "rhel9_64Guest", "Red Hat Enterprise Linux 9 (64-bit)", [disk("Hard disk 1", 20, "ds1"), dvnic("dvportgroup-210", "00:50:56:aa:02:01")])
+fd = mtv.mtv_vm_facts(sd, dd, "haproxy", pgs)
+assert fd["networks"] == ["segment-migrating-to-ocpvirt"] and fd["network_ids"] == {"segment-migrating-to-ocpvirt": "dvportgroup-210"}, fd
+by_name = [{"source": "segment-migrating-to-ocpvirt", "type": "pod"}]
+assert mtv.mtv_decide([fd], network_mappings=by_name)["decisions"][0]["eligible"]
+assert mtv.mtv_net_entries(by_name, [fd, fd], "migrated-vms") == [{"source": {"id": "dvportgroup-210"}, "destination": {"type": "pod"}}]
+# lookup failed: the raw key still works, in either spelling
+fr = mtv.mtv_vm_facts(sd, dd, "haproxy")
+assert fr["networks"] == ["dvportgroup:dvportgroup-210"]
+assert not mtv.mtv_decide([fr], network_mappings=by_name)["decisions"][0]["eligible"]
+for src in ("dvportgroup-210", "dvportgroup:dvportgroup-210"):
+    mp = [{"source": src, "type": "multus", "name": "vlan210"}]
+    assert mtv.mtv_decide([fr], network_mappings=mp)["decisions"][0]["eligible"]
+    assert mtv.mtv_net_entries(mp, [fr], "migrated-vms") == [{"source": {"id": "dvportgroup-210"}, "destination": {"type": "multus", "name": "vlan210", "namespace": "migrated-vms"}}]
+# standard port groups are unchanged: by name
+assert mtv.mtv_net_entries(maps, [facts[0], facts[3]], "migrated-vms") == [
+    {"source": {"name": "VM Network"}, "destination": {"type": "multus", "name": "vlan20", "namespace": "migrated-vms"}},
+    {"source": {"name": "DB VLAN"}, "destination": {"type": "pod"}}]
+# discovery stored before this change has no network_ids
+old_f = dict(facts[0]); old_f.pop("network_ids")
+assert mtv.mtv_decide([old_f], network_mappings=maps)["decisions"][0]["eligible"]
 print("ALL FILTER TESTS PASSED")

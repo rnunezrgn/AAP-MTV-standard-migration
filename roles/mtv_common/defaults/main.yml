@@ -33,7 +33,7 @@ mtv_target_power_state: "on"
 mtv_luks_secret: ""
 
 # Map every source network to a destination. Unmapped networks block the VM.
-#   - source: "VM Network"      # port group name, or dvportgroup:<key>
+#   - source: "VM Network"      # port group name, standard or distributed
 #     type: multus              # multus | pod
 #     name: vlan20              # NetworkAttachmentDefinition (multus only)
 #     namespace: migrated-vms
@@ -96,6 +96,11 @@ target_enable_secure_boot: true     # only where the source had Secure Boot on
 target_add_vtpm_windows: true
 target_add_vtpm_linux: auto         # auto: source had a vTPM or LUKS uses TPM2
 target_persistent_efi: true
+
+# Set to false when AAP cannot log in to the guests (no route, VMs powered
+# off, no credentials). Nodes 03, 07 and 09 then skip every in-guest step and
+# record that they did, so the VMs still migrate on the vCenter and MTV checks.
+mtv_guest_checks: true
 
 # Per host: the vCenter VM name when it differs from the inventory hostname
 mtv_vm: "{{ mtv_vm_name | default(inventory_hostname) }}"

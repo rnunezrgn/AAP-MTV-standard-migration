@@ -46,9 +46,25 @@
   register: _detail
   failed_when: false
 
+# vCenter reports a NIC on a distributed port group by key (dvportgroup-123),
+# not by name. Look the names up so network_mappings can use the name people see.
+- name: Discover | Read distributed port group names
+  community.vmware.vmware_dvs_portgroup_info:
+    datacenter: "{{ vcenter_datacenter }}"
+    validate_certs: "{{ vcenter_validate_certs }}"
+    show_mac_learning: false
+    show_network_policy: false
+    show_teaming_policy: false
+    show_uplinks: false
+    show_port_policy: false
+  register: _dvpg
+  failed_when: false
+
 - name: Discover | Normalise per-VM facts
   ansible.builtin.set_fact:
-    mtv_discovery: "{{ mtv_discovery | default([]) + [item.0 | mtv_vm_facts(item.1, item.0.item)] }}"
+    mtv_discovery: >-
+      {{ mtv_discovery | default([])
+         + [item.0 | mtv_vm_facts(item.1, item.0.item, _dvpg | mtv_portgroups)] }}
   loop: "{{ _summary.results | zip(_detail.results) | list }}"
   loop_control:
     label: "{{ item.0.item }}"

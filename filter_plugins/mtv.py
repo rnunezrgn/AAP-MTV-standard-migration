@@ -51,7 +51,60 @@ def _classify_os(guest_id, full_name):
     return "unknown"
 
 
-def mtv_vm_facts(summary_result, detail_result, name):
+def mtv_portgroups(result):
+    """{key: name} from a vmware_dvs_portgroup_info result. Empty when it failed."""
+    out = {}
+    info = (result or {}).get("dvs_portgroup_info") or {}
+    for groups in info.values():
+        for g in groups or []:
+            key = g.get("key") or g.get("moid")
+            if key and g.get("portgroup_name"):
+                out[str(key)] = str(g["portgroup_name"])
+    return out
+
+
+def _net_mapping(label, net_id, mappings):
+    """The network_mappings entry for one source network, or None.
+
+    A mapping matches on the port group name, or for a distributed port group
+    also on its vCenter id, written as dvportgroup-123 or dvportgroup:dvportgroup-123.
+    """
+    wanted = {label}
+    if net_id:
+        wanted.update({net_id, "dvportgroup:" + net_id})
+    for m in mappings or []:
+        if m.get("source") in wanted:
+            return m
+    return None
+
+
+def mtv_net_entries(mappings, sources, default_namespace=""):
+    """NetworkMap spec.map entries for the networks used by these VMs.
+
+    Distributed port groups are referenced by id, which is unambiguous in MTV;
+    standard port groups by name.
+    """
+    seen, entries = set(), []
+    for f in sources or []:
+        ids = f.get("network_ids") or {}
+        for label in f.get("networks") or []:
+            if label in seen:
+                continue
+            seen.add(label)
+            m = _net_mapping(label, ids.get(label), mappings)
+            if not m:
+                continue
+            src = {"id": ids[label]} if ids.get(label) else {"name": label}
+            if m.get("type") == "pod":
+                dst = {"type": "pod"}
+            else:
+                dst = {"type": "multus", "name": m.get("name"),
+                       "namespace": m.get("namespace") or default_namespace}
+            entries.append({"source": src, "destination": dst})
+    return entries
+
+
+def mtv_vm_facts(summary_result, detail_result, name, portgroups=None):
     """Normalise two vmware_guest_info results (summary + vsphere schema)."""
     facts = {"vm": name, "found": False}
     if not summary_result or summary_result.get("failed") or "instance" not in summary_result:
@@ -63,6 +116,7 @@ def mtv_vm_facts(summary_result, detail_result, name):
     guest_id = _get(d, "config.guestId") or s.get("hw_guest_id")
     full_name = _get(d, "config.guestFullName") or s.get("hw_guest_full_name")
     disks, nics = [], []
+    network_ids = {}
     has_vtpm = has_pvscsi = False
     for dev in _get(d, "config.hardware.device", []) or []:
         vt = str(dev.get("_vimtype", ""))
@@ -81,8 +135,11 @@ def mtv_vm_facts(summary_result, detail_result, name):
             })
         elif "macAddress" in dev:
             net = backing.get("deviceName")
-            if not net and isinstance(backing.get("port"), dict):
-                net = "dvportgroup:" + str(backing["port"].get("portgroupKey", ""))
+            if isinstance(backing.get("port"), dict) and backing["port"].get("portgroupKey"):
+                key = str(backing["port"]["portgroupKey"])
+                # Name when Discover could look it up, otherwise the raw key.
+                net = (portgroups or {}).get(key) or "dvportgroup:" + key
+                network_ids[net] = key
             if not net and backing.get("opaqueNetworkId"):
                 net = "opaque:" + str(backing["opaqueNetworkId"])
             nics.append({"label": label, "mac": dev.get("macAddress", ""),
@@ -124,6 +181,7 @@ def mtv_vm_facts(summary_result, detail_result, name):
         "max_disk_gb": max([x["gb"] for x in disks] or [0]),
         "datastores": sorted({x["datastore"] for x in disks if x["datastore"]}),
         "networks": sorted({x["network"] for x in nics if x["network"]}),
+        "network_ids": network_ids,
     })
     return facts
 
@@ -172,14 +230,14 @@ def mtv_decide(discovery, mode="auto", warm_min_disk_gb=100, large_disk_gb=1024,
                max_vms_per_plan=10, run_id="manual", network_mappings=None,
                cold_fallback=True):
     """Return {'decisions': [...], 'plans': [...]} for a list of VM facts."""
-    mapped = {m.get("source") for m in (network_mappings or [])}
     decisions = []
     for f in discovery:
         checks = [x for x in mtv_discover_checks(f) if x["status"] == "fail"]
         blockers = [x["title"] + ": " + x["detail"] for x in checks]
         if f.get("found"):
+            ids = f.get("network_ids") or {}
             for net in f["networks"]:
-                if net not in mapped:
+                if not _net_mapping(net, ids.get(net), network_mappings):
                     blockers.append("Network '%s' has no entry in network_mappings" % net)
         reasons = []
         chosen = None
@@ -419,6 +477,8 @@ class FilterModule(object):
         return {
             "mtv_dns": mtv_dns,
             "mtv_vm_facts": mtv_vm_facts,
+            "mtv_portgroups": mtv_portgroups,
+            "mtv_net_entries": mtv_net_entries,
             "mtv_discover_checks": mtv_discover_checks,
             "mtv_decide": mtv_decide,
             "mtv_pick": mtv_pick,

@@ -25,7 +25,8 @@
     - name: Only planned Windows VMs
       ansible.builtin.meta: end_host
       when: >-
-        mtv_vm not in hostvars['localhost'].mtv_planned_vms | default([])
+        not (mtv_guest_checks | bool)
+        or mtv_vm not in hostvars['localhost'].mtv_planned_vms | default([])
         or mtv_vm not in hostvars['localhost'].mtv_eligible_windows | default([])
 
     - name: Windows cutover prep
@@ -42,7 +43,8 @@
     - name: Only planned Linux VMs
       ansible.builtin.meta: end_host
       when: >-
-        mtv_vm not in hostvars['localhost'].mtv_planned_vms | default([])
+        not (mtv_guest_checks | bool)
+        or mtv_vm not in hostvars['localhost'].mtv_planned_vms | default([])
         or mtv_vm not in hostvars['localhost'].mtv_eligible_linux | default([])
 
     - name: Linux cutover prep

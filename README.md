@@ -130,7 +130,7 @@ its input back from OpenShift rather than from the previous job.
 
 - **AAP 2.5** with an execution environment built from `execution-environment.yml` (`kubernetes.core`, `community.vmware`, `vmware.vmware`, `ansible.windows`, plus `kubernetes`, `pyvmomi`, `pywinrm`).
 - **MTV 2.12** on OpenShift 4.20 or later, with a vSphere Provider (VDDK image configured) and the `host` destination Provider.
-- **network_mappings** for every source port group. Unmapped networks block the VM in Decide. For preserved IPs, map to a Multus bridge or localnet NAD on the same VLAN, not the pod network.
+- **network_mappings** for every source port group, by the name shown in vCenter (standard or distributed). Unmapped networks block the VM in Decide. For preserved IPs, map to a Multus bridge or localnet NAD on the same VLAN, not the pod network.
 - **Persistent vTPM and EFI** need `vmStateStorageClass` set on the HyperConverged CR.
 - **Guest access**: WinRM over HTTPS to Windows, SSH with sudo to Linux, on the same IPs before and after migration.
 - **virtio_win_iso_url**: an internal URL serving the current Red Hat `virtio-win` ISO (from the `virtio-win` RPM).

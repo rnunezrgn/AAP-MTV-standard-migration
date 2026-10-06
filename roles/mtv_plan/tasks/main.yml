@@ -29,8 +29,9 @@
       {{ mtv_plans | map('mtv_plan_filter', _go) | selectattr('vms') | list }}
     _datastores: >-
       {{ _go | map('extract', mtv_decision_map) | map(attribute='source.datastores') | flatten | unique | list }}
-    _networks: >-
-      {{ _go | map('extract', mtv_decision_map) | map(attribute='source.networks') | flatten | unique | list }}
+    _net_entries: >-
+      {{ network_mappings | mtv_net_entries(_go | map('extract', mtv_decision_map) | map(attribute='source') | list,
+                                            mtv_target_namespace) }}
 
 - name: Plan | Create the StorageMap and NetworkMap
   kubernetes.core.k8s:
