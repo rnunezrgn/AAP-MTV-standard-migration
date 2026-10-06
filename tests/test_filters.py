@@ -148,4 +148,41 @@ assert mtv.mtv_storage_entries([fh], SC, ["workload_share", "datastore-9"]) == [
     {"source": {"name": "workload_share"}, "destination": {"storageClass": SC}},
     {"source": {"id": "datastore-9"}, "destination": {"storageClass": SC}}]
 assert mtv.mtv_storage_entries([fh], SC, "workload_share") == [{"source": {"name": "workload_share"}, "destination": {"storageClass": SC}}]
+# Maps built from MTV's inventory
+ans = [{"status": 200, "item": {"vm": "winweb01-user1", "moid": "vm-9"},
+        "json": {"id": "vm-9", "networks": [{"kind": "Network", "id": "dvportgroup-210"}],
+                 "nics": [{"network": {"kind": "Network", "id": "dvportgroup-210"}, "mac": "00:50:56:00:00:01"}],
+                 "disks": [{"file": "[ws] a.vmdk", "datastore": {"kind": "Datastore", "id": "datastore-7"}}]}},
+       {"status": 404, "item": {"vm": "gone"}, "json": {}}, {"skipped": True, "item": {"vm": "skipped"}}]
+iv = mtv.mtv_inventory_vms(ans)
+assert iv == {"winweb01-user1": {"networks": ["dvportgroup-210"], "datastores": ["datastore-7"]}}, iv
+nn = mtv.mtv_inventory_names({"status": 200, "json": [{"id": "dvportgroup-210", "name": "segment-migrating-to-ocpvirt"}, {"id": "network-1", "name": "VM Network"}]})
+assert nn["dvportgroup-210"] == "segment-migrating-to-ocpvirt" and mtv.mtv_inventory_names({"skipped": True}) == {}
+blank = {"vm": "winweb01-user1", "moid": "vm-9", "networks": [], "datastores": []}   # vCenter said nothing
+mp = mtv.mtv_maps([blank], by_name, SC, inventory=iv, net_names=nn, default_namespace="migrated-vms")
+assert mp["network"] == [{"source": {"id": "dvportgroup-210"}, "destination": {"type": "pod"}}], mp
+assert mp["storage"] == [{"source": {"id": "datastore-7"}, "destination": {"storageClass": SC}}] and mp["unmapped"] == []
+assert mp["origin"] == {"winweb01-user1": "MTV inventory"}
+# the name is unknown to MTV or differs: reported, not silently dropped
+mu = mtv.mtv_maps([blank], by_name, SC, inventory=iv, net_names={})
+assert mu["network"] == [] and mu["unmapped"] == ["winweb01-user1: dvportgroup-210"]
+mu2 = mtv.mtv_maps([blank], [{"source": "other", "type": "pod"}], SC, inventory=iv, net_names=nn)
+assert mu2["unmapped"] == ["winweb01-user1: segment-migrating-to-ocpvirt (dvportgroup-210)"]
+# catch-all, and mapping by id
+for src in ("*", "dvportgroup-210"):
+    assert mtv.mtv_maps([blank], [{"source": src, "type": "pod"}], SC, inventory=iv)["network"] == mp["network"]
+assert mtv.mtv_decide([fr], network_mappings=[{"source": "*", "type": "pod"}])["decisions"][0]["eligible"]
+# no inventory answer: vCenter facts as before; mixed runs combine both
+mv = mtv.mtv_maps([fd, facts[0]], by_name + maps, SC, inventory={}, default_namespace="migrated-vms")
+assert mv["network"] == [{"source": {"id": "dvportgroup-210"}, "destination": {"type": "pod"}},
+                         {"source": {"name": "VM Network"}, "destination": {"type": "multus", "name": "vlan20", "namespace": "migrated-vms"}}], mv
+assert {"source": {"name": "ds-nfs-01"}, "destination": {"storageClass": SC}} in mv["storage"] and mv["origin"]["haproxy"] == "vCenter"
+mx = mtv.mtv_maps([blank, facts[0]], by_name + maps, SC, inventory=iv, net_names=nn, default_namespace="migrated-vms")
+assert [e["source"] for e in mx["network"]] == [{"id": "dvportgroup-210"}, {"name": "VM Network"}]
+assert [e["source"] for e in mx["storage"]] == [{"name": "ds-nfs-01"}, {"id": "datastore-7"}], mx["storage"]
+# nothing known anywhere: every datastore of the provider, then the override
+assert mtv.mtv_maps([blank], by_name, SC, inventory={}, all_datastores=["datastore-7", "datastore-9"])["storage"] == [
+    {"source": {"id": "datastore-7"}, "destination": {"storageClass": SC}}, {"source": {"id": "datastore-9"}, "destination": {"storageClass": SC}}]
+assert mtv.mtv_maps([blank], by_name, SC, inventory=iv, source_datastores=["ws"])["storage"] == [{"source": {"name": "ws"}, "destination": {"storageClass": SC}}]
+assert mtv.mtv_maps([blank], by_name, SC)["storage"] == []
 print("ALL FILTER TESTS PASSED")

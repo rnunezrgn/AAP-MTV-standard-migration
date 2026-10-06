@@ -1,0 +1,79 @@
+---
+# Reads, from MTV's inventory service, the networks and datastores of the VMs
+# about to be planned. MTV validates a Plan against this same inventory, and
+# its provider has its own vCenter access, so this works where the AAP vCenter
+# account sees little. Every step is best effort.
+# Output: _inv_vms {vm: {networks: [ids], datastores: [ids]}}, _inv_net_names
+#         {id: name}, _inv_all_datastores [ids].
+- name: Inventory | Find the source provider and the inventory route
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.api }}"
+    kind: "{{ item.kind }}"
+    namespace: "{{ item.ns }}"
+    name: "{{ item.name }}"
+  loop:
+    - { api: forklift.konveyor.io/v1beta1, kind: Provider, ns: "{{ mtv_source_provider_namespace }}", name: "{{ mtv_source_provider }}" }
+    - { api: route.openshift.io/v1, kind: Route, ns: "{{ mtv_namespace }}", name: "{{ mtv_inventory_route }}" }
+  loop_control:
+    label: "{{ item.kind }}/{{ item.name }}"
+  register: _inv_lookup
+  failed_when: false
+
+- name: Inventory | Work out the inventory URL
+  ansible.builtin.set_fact:
+    _inv_base: >-
+      {{ ('https://' ~ _r[0].spec.host ~ '/providers/' ~ (_p[0].spec.type | default('vsphere')) ~ '/' ~ _p[0].metadata.uid)
+         if (_p | length > 0 and _r | length > 0) else '' }}
+    _inv_headers:
+      Authorization: "Bearer {{ lookup('ansible.builtin.env', 'K8S_AUTH_API_KEY') }}"
+  vars:
+    _p: "{{ _inv_lookup.results[0].resources | default([]) }}"
+    _r: "{{ _inv_lookup.results[1].resources | default([]) }}"
+  no_log: true
+
+- name: Inventory | Say why the lookup cannot run
+  ansible.builtin.debug:
+    msg: >-
+      Provider {{ mtv_source_provider }} in {{ mtv_source_provider_namespace }} or route
+      {{ mtv_inventory_route }} in {{ mtv_namespace }} was not found. Using vCenter facts only.
+  when: not _inv_base
+
+- name: Inventory | Read each VM from MTV
+  ansible.builtin.uri:
+    url: "{{ _inv_base }}/vms/{{ item.moid }}"
+    headers: "{{ _inv_headers }}"
+    validate_certs: false
+    return_content: true
+    timeout: 60
+  loop: "{{ _go_sources }}"
+  loop_control:
+    label: "{{ item.vm }}"
+  register: _inv_vm_answers
+  failed_when: false
+  no_log: true
+  when: _inv_base | length > 0
+
+- name: Inventory | Read the network and datastore names from MTV
+  ansible.builtin.uri:
+    url: "{{ _inv_base }}/{{ item }}"
+    headers: "{{ _inv_headers }}"
+    validate_certs: false
+    return_content: true
+    timeout: 60
+  loop: [networks, datastores]
+  register: _inv_lists
+  failed_when: false
+  no_log: true
+  when: _inv_base | length > 0
+
+- name: Inventory | Keep what MTV returned
+  ansible.builtin.set_fact:
+    _inv_vms: "{{ _inv_vm_answers.results | default([]) | mtv_inventory_vms }}"
+    _inv_net_names: "{{ (_inv_lists.results | default([{}, {}]))[0] | mtv_inventory_names }}"
+    _inv_all_datastores: "{{ ((_inv_lists.results | default([{}, {}]))[1] | mtv_inventory_names).keys() | list }}"
+
+- name: Inventory | Result
+  ansible.builtin.debug:
+    msg: >-
+      MTV inventory: HTTP {{ _inv_vm_answers.results | default([]) | map(attribute='status', default='not asked') | unique | join(', ') or 'not asked' }},
+      answered for {{ _inv_vms.keys() | list | join(', ') or 'no VM' }}

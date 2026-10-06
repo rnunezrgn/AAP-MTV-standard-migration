@@ -28,35 +28,51 @@
     _plans: >-
       {{ mtv_plans | map('mtv_plan_filter', _go) | selectattr('vms') | list }}
     _go_sources: "{{ _go | map('extract', mtv_decision_map) | map(attribute='source') | list }}"
-    _net_entries: >-
-      {{ network_mappings | mtv_net_entries(_go | map('extract', mtv_decision_map) | map(attribute='source') | list,
-                                            mtv_target_namespace) }}
 
-- name: Plan | Storage mappings from vCenter facts or source_datastores
+# MTV checks a Plan against its own inventory, so ask that inventory which
+# networks and datastores each VM uses. Best effort: without an answer the
+# maps are built from the vCenter facts gathered by Discover.
+- name: Plan | Ask MTV which networks and datastores the VMs use
+  ansible.builtin.include_tasks: inventory.yml
+
+- name: Plan | Build the network and storage mappings
   ansible.builtin.set_fact:
-    _storage_entries: "{{ _go_sources | mtv_storage_entries(mtv_target_storage_class, source_datastores) }}"
-    _ds_unknown: >-
-      {{ [] if source_datastores | length > 0 else
-         (_go_sources | rejectattr('datastores') | rejectattr('datastore_ids', 'defined') | list
-          + _go_sources | rejectattr('datastores') | selectattr('datastore_ids', 'defined')
-            | rejectattr('datastore_ids') | list) }}
+    _maps: >-
+      {{ _go_sources | mtv_maps(network_mappings, mtv_target_storage_class,
+                                inventory=_inv_vms, net_names=_inv_net_names,
+                                source_datastores=source_datastores,
+                                all_datastores=_inv_all_datastores,
+                                default_namespace=mtv_target_namespace) }}
 
-- name: Plan | Ask MTV for the datastores vCenter did not report
-  ansible.builtin.include_tasks: inventory_datastores.yml
-  when: _ds_unknown | length > 0
+- name: Plan | Show the mappings
+  ansible.builtin.debug:
+    msg:
+      - "VM details from: {{ _maps.origin | dict2items | map(attribute='key') | zip(_maps.origin | dict2items | map(attribute='value')) | map('join', ' = ') | join(', ') }}"
+      - "Networks: {{ _maps.network | map(attribute='source') | list }}"
+      - "Datastores: {{ _maps.storage | map(attribute='source') | list }} -> {{ mtv_target_storage_class }}"
+
+- name: Plan | Every VM network needs an entry in network_mappings
+  ansible.builtin.assert:
+    that: _maps.unmapped | length == 0
+    fail_msg: >-
+      MTV sees these VM networks, and network_mappings has no entry for them:
+      {{ _maps.unmapped | join('; ') }}.
+      Add each one as a source (by name or id), or add a catch-all entry with source "*".
+    quiet: true
 
 - name: Plan | A StorageMap needs at least one source datastore
   ansible.builtin.assert:
-    that: _storage_entries | length > 0
+    that: _maps.storage | length > 0
     fail_msg: >-
-      No source datastore is known for {{ _go | join(', ') }}: vCenter did not report one
-      and the MTV inventory lookup returned nothing. Set source_datastores to the datastore
-      name(s) shown for the {{ mtv_source_provider }} provider in the MTV console.
+      No source datastore is known for {{ _go | join(', ') }}: neither vCenter nor the MTV
+      inventory reported one. Set source_datastores to the datastore name(s) shown for the
+      {{ mtv_source_provider }} provider in the MTV console.
     quiet: true
 
-- name: Plan | Show the storage mapping
-  ansible.builtin.debug:
-    msg: "{{ _storage_entries | map(attribute='source') | list }} -> {{ mtv_target_storage_class }}"
+- name: Plan | Names used by the map templates
+  ansible.builtin.set_fact:
+    _net_entries: "{{ _maps.network }}"
+    _storage_entries: "{{ _maps.storage }}"
 
 - name: Plan | Create the StorageMap and NetworkMap
   kubernetes.core.k8s:
@@ -80,10 +96,16 @@
     namespace: "{{ mtv_namespace }}"
     name: "{{ item.name }}"
   register: _plan_state
+  # Stop when the Plan is Ready, or when MTV has kept a Critical condition on
+  # it for a minute (waiting longer would not change that).
   until: >-
     _plan_state.resources | length > 0 and
-    (_plan_state.resources[0].status.conditions | default([])
-     | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length > 0)
+    ((_plan_state.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length > 0)
+     or ((_plan_state.attempts | default(1) | int) >= 6 and
+         (_plan_state.resources[0].status.conditions | default([])
+          | selectattr('category', 'defined') | selectattr('category', 'equalto', 'Critical')
+          | selectattr('status', 'equalto', 'True') | list | length > 0)))
   retries: "{{ mtv_plan_ready_retries }}"
   delay: 10
   loop: "{{ _plans }}"
@@ -100,6 +122,8 @@
       Plan {{ item.item.name }} is not Ready:
       {{ item.resources[0].status.conditions | default([]) | rejectattr('type', 'equalto', 'Ready')
          | map(attribute='message') | join(' | ') }}
+      (maps used: networks {{ _net_entries | map(attribute='source') | list }},
+      datastores {{ _storage_entries | map(attribute='source') | list }})
     quiet: true
   loop: "{{ _plan_state.results }}"
   loop_control:

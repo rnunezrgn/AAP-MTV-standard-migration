@@ -75,7 +75,93 @@ def _net_mapping(label, net_id, mappings):
     for m in mappings or []:
         if m.get("source") in wanted:
             return m
+    for m in mappings or []:
+        if m.get("source") == "*":      # catch-all
+            return m
     return None
+
+
+def _net_destination(m, default_namespace):
+    if m.get("type") == "pod":
+        return {"type": "pod"}
+    return {"type": "multus", "name": m.get("name"),
+            "namespace": m.get("namespace") or default_namespace}
+
+
+def mtv_inventory_vms(results):
+    """{vm name: {'networks': [ids], 'datastores': [ids]}} from MTV inventory
+    answers for single VMs (uri results looped over the VM facts)."""
+    out = {}
+    for r in results or []:
+        doc = (r or {}).get("json")
+        name = ((r or {}).get("item") or {}).get("vm")
+        if not name or not isinstance(doc, dict) or r.get("status") != 200:
+            continue
+        nets = [str(n.get("id")) for n in doc.get("networks") or [] if isinstance(n, dict) and n.get("id")]
+        for nic in doc.get("nics") or []:
+            nid = ((nic or {}).get("network") or {}).get("id")
+            if nid and str(nid) not in nets:
+                nets.append(str(nid))
+        dss = []
+        for d in doc.get("disks") or []:
+            did = ((d or {}).get("datastore") or {}).get("id")
+            if did and str(did) not in dss:
+                dss.append(str(did))
+        out[name] = {"networks": nets, "datastores": dss}
+    return out
+
+
+def mtv_inventory_names(result):
+    """{id: name} from an MTV inventory list answer (networks, datastores)."""
+    doc = (result or {}).get("json")
+    return {str(x["id"]): str(x.get("name") or "") for x in doc
+            if isinstance(x, dict) and x.get("id")} if isinstance(doc, list) else {}
+
+
+def mtv_maps(sources, mappings, storage_class, inventory=None, net_names=None,
+             source_datastores=None, all_datastores=None, default_namespace=""):
+    """Network and storage map entries for a set of VMs.
+
+    MTV checks a Plan against its own inventory, so what that inventory says
+    about a VM wins. VMs it gave no answer for fall back to the vCenter facts.
+    Returns {'network': [...], 'storage': [...], 'unmapped': [...], 'origin': {...}}.
+    """
+    inventory, net_names = inventory or {}, net_names or {}
+    net, seen_net, unmapped, origin = [], set(), [], {}
+    rest = []
+    for f in sources or []:
+        iv = inventory.get(f.get("vm"))
+        if iv is None:
+            rest.append(f)
+            origin[f.get("vm")] = "vCenter"
+            continue
+        origin[f.get("vm")] = "MTV inventory"
+        for nid in iv["networks"]:
+            label = net_names.get(nid, "")
+            m = _net_mapping(label, nid, mappings)
+            if not m:
+                unmapped.append("%s: %s" % (f.get("vm"), ("%s (%s)" % (label, nid)) if label else nid))
+            elif nid not in seen_net:
+                seen_net.add(nid)
+                net.append({"source": {"id": nid}, "destination": _net_destination(m, default_namespace)})
+    for e in mtv_net_entries(mappings, rest, default_namespace):
+        key = e["source"].get("id") or e["source"].get("name")
+        if key not in seen_net:
+            seen_net.add(key)
+            net.append(e)
+
+    if source_datastores:
+        sto = mtv_storage_entries([], storage_class, source_datastores)
+    else:
+        ids = []
+        for f in sources or []:
+            for i in (inventory.get(f.get("vm")) or {}).get("datastores") or []:
+                if i not in ids:
+                    ids.append(i)
+        sto = mtv_storage_entries(rest, storage_class, None, ids)
+        if not sto:
+            sto = mtv_storage_entries([], storage_class, None, list(all_datastores or []))
+    return {"network": net, "storage": sto, "unmapped": unmapped, "origin": origin}
 
 
 def mtv_net_entries(mappings, sources, default_namespace=""):
@@ -95,12 +181,7 @@ def mtv_net_entries(mappings, sources, default_namespace=""):
             if not m:
                 continue
             src = {"id": ids[label]} if ids.get(label) else {"name": label}
-            if m.get("type") == "pod":
-                dst = {"type": "pod"}
-            else:
-                dst = {"type": "multus", "name": m.get("name"),
-                       "namespace": m.get("namespace") or default_namespace}
-            entries.append({"source": src, "destination": dst})
+            entries.append({"source": src, "destination": _net_destination(m, default_namespace)})
     return entries
 
 
@@ -564,6 +645,9 @@ class FilterModule(object):
             "mtv_vm_facts": mtv_vm_facts,
             "mtv_portgroups": mtv_portgroups,
             "mtv_storage_entries": mtv_storage_entries,
+            "mtv_inventory_vms": mtv_inventory_vms,
+            "mtv_inventory_names": mtv_inventory_names,
+            "mtv_maps": mtv_maps,
             "mtv_inventory_datastores": mtv_inventory_datastores,
             "mtv_net_entries": mtv_net_entries,
             "mtv_discover_checks": mtv_discover_checks,
