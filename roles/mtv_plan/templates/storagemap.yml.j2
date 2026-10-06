@@ -10,8 +10,4 @@ spec:
   provider:
     source: { name: {{ mtv_source_provider }}, namespace: {{ mtv_source_provider_namespace }} }
     destination: { name: {{ mtv_destination_provider }}, namespace: {{ mtv_destination_provider_namespace }} }
-  map:
-{% for ds in _datastores %}
-    - source: { name: {{ ds | to_json }} }
-      destination: { storageClass: {{ mtv_target_storage_class }} }
-{% endfor %}
+  map: {{ _storage_entries | to_json }}

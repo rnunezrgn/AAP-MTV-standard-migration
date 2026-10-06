@@ -104,6 +104,73 @@ def mtv_net_entries(mappings, sources, default_namespace=""):
     return entries
 
 
+def _moref_id(ref):
+    """'datastore-42' from 'vim.Datastore:datastore-42' or a {'_vimid': ...} dict."""
+    if isinstance(ref, dict):
+        ref = ref.get("_vimid") or ref.get("_vimref") or ""
+    ref = str(ref or "")
+    return ref.split(":", 1)[1] if ":" in ref else ref
+
+
+def _bracket_name(path):
+    m = re.match(r"^\[(.+?)\]", str(path or ""))
+    return m.group(1) if m else ""
+
+
+def mtv_inventory_datastores(results):
+    """Datastore ids from MTV inventory answers (uri results).
+
+    Accepts VM documents ({'disks': [{'datastore': {'id': ...}}]}) and
+    datastore lists ([{'id': ...}]).
+    """
+    ids = []
+    for r in results or []:
+        doc = (r or {}).get("json")
+        if isinstance(doc, dict):
+            items = [(d.get("datastore") or {}) for d in doc.get("disks") or []]
+        elif isinstance(doc, list):
+            items = doc
+        else:
+            items = []
+        for it in items:
+            if isinstance(it, dict) and it.get("id") and it["id"] not in ids:
+                ids.append(str(it["id"]))
+    return ids
+
+
+def mtv_storage_entries(sources, storage_class, override=None, extra_ids=None):
+    """StorageMap spec.map entries.
+
+    Order of trust: an explicit list (source_datastores), then what vCenter
+    reported per VM (names, else ids), then ids MTV's own inventory gave.
+    """
+    seen, entries = set(), []
+
+    def add(kind, value):
+        value = str(value or "").strip()
+        if value and (kind, value) not in seen:
+            seen.add((kind, value))
+            entries.append({"source": {kind: value},
+                            "destination": {"storageClass": storage_class}})
+
+    if isinstance(override, str):
+        override = [x for x in re.split(r"[,;\s]+", override) if x]
+    if override:
+        for item in override:
+            add("id" if re.match(r"^datastore-\d+$", str(item)) else "name", item)
+        return entries
+    for f in sources or []:
+        if f.get("datastores"):
+            for n in f["datastores"]:
+                add("name", n)
+        else:
+            for i in f.get("datastore_ids") or []:
+                add("id", i)
+    for i in extra_ids or []:
+        add("id", i)
+    return entries
+
+
 def mtv_vm_facts(summary_result, detail_result, name, portgroups=None):
     """Normalise two vmware_guest_info results (summary + vsphere schema)."""
     facts = {"vm": name, "found": False}
@@ -129,6 +196,7 @@ def mtv_vm_facts(summary_result, detail_result, name, portgroups=None):
                 "label": label,
                 "gb": round((dev.get("capacityInBytes") or 0) / GIB, 1),
                 "datastore": m.group(1) if m else "",
+                "datastore_id": _moref_id(backing.get("datastore")),
                 "mode": backing.get("diskMode", ""),
                 "rdm": "compatibilityMode" in backing or "RawDiskMapping" in str(backing.get("_vimtype", "")),
                 "sharing": backing.get("sharing", ""),
@@ -155,6 +223,16 @@ def mtv_vm_facts(summary_result, detail_result, name, portgroups=None):
     if not ips and s.get("ipv4"):
         ips = [s["ipv4"]]
 
+    # Datastores: from the disk file paths, else from what vCenter says about the VM.
+    ds_names = sorted({x["datastore"] for x in disks if x["datastore"]})
+    if not ds_names:
+        alt = [u.get("name") for u in _get(d, "config.datastoreUrl", []) or [] if isinstance(u, dict)]
+        alt.append(_bracket_name(_get(d, "config.files.vmPathName")))
+        alt.extend(s.get("hw_datastores") or [])
+        ds_names = sorted({str(x) for x in alt if x})
+    ds_ids = sorted({x["datastore_id"] for x in disks if x["datastore_id"]}
+                    | {_moref_id(r) for r in d.get("datastore") or [] if _moref_id(r)})
+
     os_family = _classify_os(guest_id, full_name)
     m = re.search(r"(rhel|red hat enterprise linux)\D*(\d+)", ((guest_id or "") + " " + (full_name or "")).lower())
     facts.update({
@@ -179,7 +257,8 @@ def mtv_vm_facts(summary_result, detail_result, name, portgroups=None):
         "ips": sorted(set(ips)),
         "total_gb": round(sum(x["gb"] for x in disks), 1),
         "max_disk_gb": max([x["gb"] for x in disks] or [0]),
-        "datastores": sorted({x["datastore"] for x in disks if x["datastore"]}),
+        "datastores": ds_names,
+        "datastore_ids": ds_ids,
         "networks": sorted({x["network"] for x in nics if x["network"]}),
         "network_ids": network_ids,
     })
@@ -220,7 +299,8 @@ def mtv_discover_checks(f):
     c.append(_check("tools", "VMware Tools running", "pass" if tools_ok else "warn",
                     f["tools"] or "unknown") )
     c.append(_check("disks", "Disks", "info", "; ".join(
-        "%s %sGB on %s" % (x["label"], x["gb"], x["datastore"]) for x in f["disks"]) or "none"))
+        "%s %sGB on %s" % (x["label"], x["gb"], x["datastore"] or x.get("datastore_id") or "unknown datastore")
+        for x in f["disks"]) or "none"))
     c.append(_check("nics", "NICs", "info", "; ".join(
         "%s %s on %s" % (x["type"], x["mac"], x["network"]) for x in f["nics"]) or "none"))
     return c
@@ -228,7 +308,7 @@ def mtv_discover_checks(f):
 
 def mtv_decide(discovery, mode="auto", warm_min_disk_gb=100, large_disk_gb=1024,
                max_vms_per_plan=10, run_id="manual", network_mappings=None,
-               cold_fallback=True):
+               cold_fallback=True, plan_name=""):
     """Return {'decisions': [...], 'plans': [...]} for a list of VM facts."""
     decisions = []
     for f in discovery:
@@ -274,8 +354,13 @@ def mtv_decide(discovery, mode="auto", warm_min_disk_gb=100, large_disk_gb=1024,
     plans, counter = [], {"warm": 0, "cold": 0}
     def _new_plan(m):
         counter[m] += 1
-        p = {"name": mtv_dns("mtv-%s-%s-%02d" % (run_id, m, counter[m]), 63),
-             "warm": m == "warm", "vms": []}
+        if plan_name:
+            # Fixed name for the first plan; later plans get -02, -03, ...
+            n = len(plans) + 1
+            name = mtv_dns(plan_name if n == 1 else "%s-%02d" % (plan_name, n), 63)
+        else:
+            name = mtv_dns("mtv-%s-%s-%02d" % (run_id, m, counter[m]), 63)
+        p = {"name": name, "warm": m == "warm", "vms": []}
         plans.append(p)
         return p
     for m in ("warm", "cold"):
@@ -478,6 +563,8 @@ class FilterModule(object):
             "mtv_dns": mtv_dns,
             "mtv_vm_facts": mtv_vm_facts,
             "mtv_portgroups": mtv_portgroups,
+            "mtv_storage_entries": mtv_storage_entries,
+            "mtv_inventory_datastores": mtv_inventory_datastores,
             "mtv_net_entries": mtv_net_entries,
             "mtv_discover_checks": mtv_discover_checks,
             "mtv_decide": mtv_decide,

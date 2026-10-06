@@ -27,11 +27,36 @@
   ansible.builtin.set_fact:
     _plans: >-
       {{ mtv_plans | map('mtv_plan_filter', _go) | selectattr('vms') | list }}
-    _datastores: >-
-      {{ _go | map('extract', mtv_decision_map) | map(attribute='source.datastores') | flatten | unique | list }}
+    _go_sources: "{{ _go | map('extract', mtv_decision_map) | map(attribute='source') | list }}"
     _net_entries: >-
       {{ network_mappings | mtv_net_entries(_go | map('extract', mtv_decision_map) | map(attribute='source') | list,
                                             mtv_target_namespace) }}
+
+- name: Plan | Storage mappings from vCenter facts or source_datastores
+  ansible.builtin.set_fact:
+    _storage_entries: "{{ _go_sources | mtv_storage_entries(mtv_target_storage_class, source_datastores) }}"
+    _ds_unknown: >-
+      {{ [] if source_datastores | length > 0 else
+         (_go_sources | rejectattr('datastores') | rejectattr('datastore_ids', 'defined') | list
+          + _go_sources | rejectattr('datastores') | selectattr('datastore_ids', 'defined')
+            | rejectattr('datastore_ids') | list) }}
+
+- name: Plan | Ask MTV for the datastores vCenter did not report
+  ansible.builtin.include_tasks: inventory_datastores.yml
+  when: _ds_unknown | length > 0
+
+- name: Plan | A StorageMap needs at least one source datastore
+  ansible.builtin.assert:
+    that: _storage_entries | length > 0
+    fail_msg: >-
+      No source datastore is known for {{ _go | join(', ') }}: vCenter did not report one
+      and the MTV inventory lookup returned nothing. Set source_datastores to the datastore
+      name(s) shown for the {{ mtv_source_provider }} provider in the MTV console.
+    quiet: true
+
+- name: Plan | Show the storage mapping
+  ansible.builtin.debug:
+    msg: "{{ _storage_entries | map(attribute='source') | list }} -> {{ mtv_target_storage_class }}"
 
 - name: Plan | Create the StorageMap and NetworkMap
   kubernetes.core.k8s:

@@ -23,7 +23,8 @@
                       max_vms_per_plan=max_vms_per_plan,
                       run_id=mtv_run_id,
                       network_mappings=network_mappings,
-                      cold_fallback=warm_cold_fallback) }}
+                      cold_fallback=warm_cold_fallback,
+                      plan_name=mtv_plan_name) }}
 
 - name: Decide | Store the decision table
   kubernetes.core.k8s:

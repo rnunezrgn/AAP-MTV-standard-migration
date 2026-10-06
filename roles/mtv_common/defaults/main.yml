@@ -32,12 +32,22 @@ mtv_target_power_state: "on"
 # Optional Secret in mtv_namespace with LUKS passphrases for Linux guests.
 mtv_luks_secret: ""
 
+# Source datastores for the StorageMap. Leave empty: they are read from the
+# VMs in vCenter, and from MTV's own inventory when vCenter does not say.
+# Set names (or ids like datastore-123) only to override that.
+source_datastores: []
+mtv_inventory_route: forklift-inventory
+
 # Map every source network to a destination. Unmapped networks block the VM.
 #   - source: "VM Network"      # port group name, standard or distributed
 #     type: multus              # multus | pod
 #     name: vlan20              # NetworkAttachmentDefinition (multus only)
 #     namespace: migrated-vms
 network_mappings: []
+
+# Optional fixed name for the MTV Plan. Empty: mtv-<run>-<mode>-<nn>.
+# When a run needs more than one plan, the others get -02, -03, ...
+mtv_plan_name: ""
 
 # Decision thresholds
 warm_min_disk_gb: 100

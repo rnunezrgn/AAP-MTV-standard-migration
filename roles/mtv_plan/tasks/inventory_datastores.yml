@@ -1,0 +1,80 @@
+---
+# vCenter did not say which datastore some VMs are on (typical for a
+# restricted vCenter account). MTV's provider has its own access, so ask its
+# inventory service. Every step is best effort: main.yml asserts on the result.
+- name: Inventory | Find the source provider and the inventory route
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.api }}"
+    kind: "{{ item.kind }}"
+    namespace: "{{ item.ns }}"
+    name: "{{ item.name }}"
+  loop:
+    - { api: forklift.konveyor.io/v1beta1, kind: Provider, ns: "{{ mtv_source_provider_namespace }}", name: "{{ mtv_source_provider }}" }
+    - { api: route.openshift.io/v1, kind: Route, ns: "{{ mtv_namespace }}", name: "{{ mtv_inventory_route }}" }
+  loop_control:
+    label: "{{ item.kind }}/{{ item.name }}"
+  register: _inv_lookup
+  failed_when: false
+
+- name: Inventory | Work out the inventory URL
+  ansible.builtin.set_fact:
+    _inv_base: >-
+      {{ ('https://' ~ _r[0].spec.host ~ '/providers/' ~ (_p[0].spec.type | default('vsphere')) ~ '/' ~ _p[0].metadata.uid)
+         if (_p | length > 0 and _r | length > 0) else '' }}
+  vars:
+    _p: "{{ _inv_lookup.results[0].resources | default([]) }}"
+    _r: "{{ _inv_lookup.results[1].resources | default([]) }}"
+
+- name: Inventory | Say why the lookup cannot run
+  ansible.builtin.debug:
+    msg: >-
+      Provider {{ mtv_source_provider }} in {{ mtv_source_provider_namespace }} or route
+      {{ mtv_inventory_route }} in {{ mtv_namespace }} was not found.
+  when: not _inv_base
+
+- name: Inventory | Read each VM's disks from MTV
+  ansible.builtin.uri:
+    url: "{{ _inv_base }}/vms/{{ item.moid }}"
+    headers:
+      Authorization: "Bearer {{ lookup('ansible.builtin.env', 'K8S_AUTH_API_KEY') }}"
+    validate_certs: false
+    return_content: true
+    timeout: 60
+  loop: "{{ _ds_unknown }}"
+  loop_control:
+    label: "{{ item.vm }}"
+  register: _inv_vms
+  failed_when: false
+  no_log: true
+  when: _inv_base | length > 0
+
+- name: Inventory | Datastores of these VMs
+  ansible.builtin.set_fact:
+    _inv_ids: "{{ _inv_vms.results | default([]) | mtv_inventory_datastores }}"
+
+- name: Inventory | Fall back to every datastore the provider knows
+  ansible.builtin.uri:
+    url: "{{ _inv_base }}/datastores"
+    headers:
+      Authorization: "Bearer {{ lookup('ansible.builtin.env', 'K8S_AUTH_API_KEY') }}"
+    validate_certs: false
+    return_content: true
+    timeout: 60
+  register: _inv_all
+  failed_when: false
+  no_log: true
+  when: _inv_base | length > 0 and _inv_ids | length == 0
+
+- name: Inventory | Use what MTV returned
+  ansible.builtin.set_fact:
+    _inv_ids: "{{ _inv_ids if _inv_ids | length > 0 else ([_inv_all] | mtv_inventory_datastores) }}"
+
+- name: Inventory | Result
+  ansible.builtin.debug:
+    msg: >-
+      MTV inventory: HTTP {{ _inv_vms.results | default([]) | map(attribute='status', default='not asked') | unique | join(', ') or 'not asked' }},
+      datastores {{ _inv_ids | join(', ') or 'none' }}
+
+- name: Inventory | Add them to the storage mapping
+  ansible.builtin.set_fact:
+    _storage_entries: "{{ _go_sources | mtv_storage_entries(mtv_target_storage_class, [], _inv_ids) }}"

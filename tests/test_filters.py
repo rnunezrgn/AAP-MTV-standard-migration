@@ -112,4 +112,40 @@ assert mtv.mtv_net_entries(maps, [facts[0], facts[3]], "migrated-vms") == [
 # discovery stored before this change has no network_ids
 old_f = dict(facts[0]); old_f.pop("network_ids")
 assert mtv.mtv_decide([old_f], network_mappings=maps)["decisions"][0]["eligible"]
+# Fixed plan name
+on = mtv.mtv_decide([fd], mode="cold", run_id="demo1", network_mappings=by_name, plan_name="move-webapp-vmware")
+assert [p["name"] for p in on["plans"]] == ["move-webapp-vmware"] and on["decisions"][0]["plan"] == "move-webapp-vmware"
+om = mtv.mtv_decide(facts, mode="auto", run_id="4711", network_mappings=maps, plan_name="move-webapp-vmware")
+assert [p["name"] for p in om["plans"]][:2] == ["move-webapp-vmware", "move-webapp-vmware-02"], om["plans"]
+# Storage mapping sources
+SC = "ocs-external-storagecluster-ceph-rbd"
+assert f0["datastore_ids"] == [] and f0["datastores"] == ["ds-nfs-01"]
+assert mtv.mtv_storage_entries([facts[0], facts[3]], SC) == [
+    {"source": {"name": "ds-nfs-01"}, "destination": {"storageClass": SC}},
+    {"source": {"name": "ds-fc-01"}, "destination": {"storageClass": SC}}]
+# vCenter hides the file path: fall back to the datastore id on the disk
+hid = disk("Hard disk 1", 5, "x"); hid["backing"]["fileName"] = ""; hid["backing"]["datastore"] = "vim.Datastore:datastore-42"
+sh, dh = vm("database-user1", "vm-301", "centos8_64Guest", "centos8_64Guest", [hid, nic("VM Network", "00:50:56:aa:03:01")])
+fh = mtv.mtv_vm_facts(sh, dh, "database-user1")
+assert fh["datastores"] == [] and fh["datastore_ids"] == ["datastore-42"], fh
+assert mtv.mtv_storage_entries([fh], SC) == [{"source": {"id": "datastore-42"}, "destination": {"storageClass": SC}}]
+assert "datastore-42" in [c for c in mtv.mtv_discover_checks(fh) if c["id"] == "disks"][0]["detail"]
+# ... or to the VM-level names
+dh2 = json.loads(json.dumps(dh)); dh2["instance"]["config"]["hardware"]["device"][0]["backing"]["datastore"] = None
+dh2["instance"]["config"]["datastoreUrl"] = [{"name": "workload_share", "url": "ds:///x/"}]
+assert mtv.mtv_vm_facts(sh, dh2, "database-user1")["datastores"] == ["workload_share"]
+# nothing from vCenter at all: MTV inventory ids, then the explicit override
+fn = mtv.mtv_vm_facts(sh, {"failed": True}, "database-user1")
+assert fn["datastores"] == [] and fn["datastore_ids"] == [] and mtv.mtv_storage_entries([fn], SC) == []
+inv = [{"status": 200, "json": {"id": "vm-301", "disks": [{"file": "[ws] a.vmdk", "datastore": {"kind": "Datastore", "id": "datastore-7"}},
+                                                         {"file": "[ws] b.vmdk", "datastore": {"kind": "Datastore", "id": "datastore-7"}}]}},
+       {"status": 404, "msg": "not found"}, {"skipped": True}]
+assert mtv.mtv_inventory_datastores(inv) == ["datastore-7"]
+assert mtv.mtv_inventory_datastores([{"status": 200, "json": [{"id": "datastore-7", "name": "ws"}, {"id": "datastore-9"}]}]) == ["datastore-7", "datastore-9"]
+assert mtv.mtv_inventory_datastores([]) == [] and mtv.mtv_inventory_datastores([{"skipped": True}]) == []
+assert mtv.mtv_storage_entries([fn], SC, [], ["datastore-7"]) == [{"source": {"id": "datastore-7"}, "destination": {"storageClass": SC}}]
+assert mtv.mtv_storage_entries([fh], SC, ["workload_share", "datastore-9"]) == [
+    {"source": {"name": "workload_share"}, "destination": {"storageClass": SC}},
+    {"source": {"id": "datastore-9"}, "destination": {"storageClass": SC}}]
+assert mtv.mtv_storage_entries([fh], SC, "workload_share") == [{"source": {"name": "workload_share"}, "destination": {"storageClass": SC}}]
 print("ALL FILTER TESTS PASSED")

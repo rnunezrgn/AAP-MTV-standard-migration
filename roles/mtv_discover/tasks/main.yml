@@ -38,6 +38,9 @@
       - config.bootOptions
       - config.changeTrackingEnabled
       - config.hardware.device
+      - config.datastoreUrl
+      - config.files
+      - datastore
       - snapshot
       - runtime.powerState
       - guest.toolsRunningStatus
