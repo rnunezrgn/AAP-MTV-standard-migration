@@ -1,0 +1,127 @@
+---
+- name: Linux post-check | Reachability on OpenShift Virtualization
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: reach
+  vars:
+    reach_stage: postcheck
+
+- name: Linux post-check | Load the pre-migration state
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: load_evidence
+  vars:
+    ev_stage: readiness
+    ev_vm: "{{ mtv_vm }}"
+
+- name: Linux post-check | Keep the pre-migration facts
+  ansible.builtin.set_fact:
+    _pre: "{{ mtv_evidence.facts | default({}) }}"
+
+- name: Linux post-check | Gather facts
+  ansible.builtin.setup:
+    gather_subset: [min, network, hardware, virtual, selinux]
+
+- name: Linux post-check | Gather package facts
+  ansible.builtin.package_facts:
+
+- name: Linux post-check | Remove open-vm-tools
+  ansible.builtin.package:
+    name: "{{ ansible_facts.packages.keys() | select('match', '^open-vm-tools') | list }}"
+    state: absent
+  register: _ovt
+  when: ansible_facts.packages.keys() | select('match', '^open-vm-tools') | list | length > 0
+
+- name: Linux post-check | Remove leftover VMware Tools directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: [/etc/vmware-tools, /usr/lib/vmware-tools, /var/log/vmware-vmsvc-root.log]
+  register: _ovt_dirs
+
+- name: Linux post-check | Install qemu-guest-agent
+  ansible.builtin.package:
+    name: qemu-guest-agent
+    state: present
+  when: linux_install_qemu_guest_agent | bool
+
+- name: Linux post-check | Enable and start qemu-guest-agent
+  ansible.builtin.systemd_service:
+    name: qemu-guest-agent
+    enabled: true
+    state: started
+  register: _qga
+  failed_when: false
+
+- name: Linux post-check | Re-bind Clevis TPM2 to the new vTPM
+  when: linux_rebind_clevis | bool and luks_passphrase is defined and _pre.clevis_tpm2 | default([]) | length > 0
+  block:
+    - name: Linux post-check | Bind a new TPM2 slot
+      ansible.builtin.command:
+        cmd: "clevis luks bind -y -k - -d {{ item.device }} tpm2 '{{ linux_clevis_tpm2_config }}'"
+        stdin: "{{ luks_passphrase }}"
+      loop: "{{ _pre.clevis_tpm2 }}"
+      loop_control:
+        label: "{{ item.device }}"
+      no_log: true
+      register: _bind
+      changed_when: true
+
+    - name: Linux post-check | Remove the old TPM2 slots bound to the VMware vTPM
+      ansible.builtin.command: "clevis luks unbind -f -d {{ item.0.device }} -s {{ item.1 }}"
+      loop: "{{ _pre.clevis_tpm2 | subelements('slots') }}"
+      loop_control:
+        label: "{{ item.0.device }} slot {{ item.1 }}"
+      register: _unbind
+      changed_when: true
+
+- name: Linux post-check | Prove VirtIO drivers are in use
+  ansible.builtin.command: ls /sys/bus/virtio/drivers
+  register: _virtio
+  changed_when: false
+  failed_when: false
+
+- name: Linux post-check | Verify fstab
+  ansible.builtin.command: findmnt --verify
+  register: _findmnt
+  changed_when: false
+  failed_when: false
+
+- name: Linux post-check | Failed systemd units
+  ansible.builtin.command: systemctl --failed --no-legend --plain  # noqa: command-instead-of-module
+  register: _failed_units
+  changed_when: false
+
+- name: Linux post-check | SELinux denials since boot
+  ansible.builtin.shell: |
+    set -o pipefail
+    ausearch -m AVC -ts boot 2>/dev/null | grep -c '^type=AVC' || true
+  args:
+    executable: /bin/bash
+  register: _avc
+  changed_when: false
+
+- name: Linux post-check | Secure Boot state
+  ansible.builtin.command: mokutil --sb-state
+  register: _sb
+  changed_when: false
+  failed_when: false
+
+- name: Linux post-check | Compare before and after
+  ansible.builtin.set_fact:
+    _checks: "{{ lookup('ansible.builtin.template', 'postcheck_checks.yml.j2') | from_yaml }}"
+
+- name: Linux post-check | Record evidence
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    ev_stage: postcheck
+    ev_vm: "{{ mtv_vm }}"
+    ev_checks: "{{ _checks }}"
+    ev_facts:
+      ipv4: "{{ ansible_facts.all_ipv4_addresses | default([]) | sort }}"
+      default_gw: "{{ ansible_facts.default_ipv4.gateway | default('') }}"
+      dns: "{{ ansible_facts.dns.nameservers | default([]) }}"
+      virtio_drivers: "{{ _virtio.stdout_lines }}"
+      failed_units: "{{ _failed_units.stdout_lines }}"

@@ -1,0 +1,8 @@
+---
+galaxy_info:
+  role_name: mtv_report
+  author: AAP MTV migration demo
+  description: Stage role for the AAP + MTV standard-path migration workflow
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []

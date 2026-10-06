@@ -1,0 +1,78 @@
+---
+- name: Windows readiness | Reachability
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: reach
+  vars:
+    reach_stage: readiness
+
+- name: Windows readiness | Collect guest state
+  ansible.windows.win_powershell:
+    script: "{{ lookup('ansible.builtin.file', mtv_scripts_dir ~ '/Get-MigrationState.ps1') }}"
+  register: _state_raw
+  changed_when: false
+
+- name: Windows readiness | Inventory VMware components
+  ansible.windows.win_powershell:
+    script: "{{ lookup('ansible.builtin.file', mtv_scripts_dir ~ '/Invoke-VMwareRemnants.ps1') }}"
+    parameters:
+      Mode: Inventory
+      Exclude: "{{ win_remnant_exclude }}"
+  register: _remnants
+  changed_when: false
+
+- name: Windows readiness | Stage the latest VirtIO drivers in the driver store
+  when: win_stage_virtio | bool and virtio_win_iso_url | length > 0
+  block:
+    - name: Windows readiness | Download the virtio-win ISO
+      ansible.windows.win_get_url:
+        url: "{{ virtio_win_iso_url }}"
+        dest: '{{ win_temp_dir }}\virtio-win.iso'
+        checksum: "{{ virtio_win_iso_checksum.split(':')[1] if virtio_win_iso_checksum else omit }}"
+        checksum_algorithm: "{{ virtio_win_iso_checksum.split(':')[0] if virtio_win_iso_checksum else omit }}"
+        force: false
+
+    - name: Windows readiness | Add VirtIO drivers to the driver store
+      ansible.windows.win_powershell:
+        script: "{{ lookup('ansible.builtin.file', mtv_scripts_dir ~ '/Stage-VirtioDrivers.ps1') }}"
+        parameters:
+          IsoPath: '{{ win_temp_dir }}\virtio-win.iso'
+          Drivers: "{{ win_virtio_drivers }}"
+      register: _virtio
+  always:
+    - name: Windows readiness | Remove the ISO
+      ansible.windows.win_file:
+        path: '{{ win_temp_dir }}\virtio-win.iso'
+        state: absent
+
+- name: Windows readiness | Escrow BitLocker recovery passwords
+  ansible.windows.win_powershell:
+    script: "{{ lookup('ansible.builtin.file', mtv_scripts_dir ~ '/Invoke-BitLockerEscrow.ps1') }}"
+    parameters:
+      Method: "{{ bitlocker_escrow_method }}"
+  register: _escrow
+  when: _state_raw.result.bitlocker | rejectattr('status', 'equalto', 'FullyDecrypted') | list | length > 0
+
+- name: Windows readiness | Evaluate checks
+  ansible.builtin.set_fact:
+    _checks: "{{ lookup('ansible.builtin.template', 'readiness_checks.yml.j2') | from_yaml }}"
+  vars:
+    s: "{{ _state_raw.result }}"
+    rem: "{{ _remnants.result }}"
+    virtio: "{{ _virtio.result | default({}) }}"
+    escrow: "{{ _escrow.result | default([]) }}"
+
+- name: Windows readiness | Record evidence
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    ev_stage: readiness
+    ev_vm: "{{ mtv_vm }}"
+    ev_checks: "{{ _checks }}"
+    ev_facts:
+      os_family: windows
+      state: "{{ _state_raw.result }}"
+      virtio: "{{ _virtio.result | default({}) }}"
+      remnants: "{{ _remnants.result.found }}"
+      escrow: "{{ _escrow.result | default([]) }}"

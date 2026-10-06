@@ -1,0 +1,15 @@
+---
+# Node 09, play 1 (runs on localhost, before any guest work).
+- name: Target | Which VMs migrated
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: load_stage
+  vars:
+    load_stage: migrate
+    load_results: [pass, warn]
+
+- name: Target | Harden and start each migrated VM
+  ansible.builtin.include_tasks: vm.yml
+  loop: "{{ mtv_stage_vms }}"
+  loop_control:
+    loop_var: _vmname

@@ -1,0 +1,21 @@
+---
+# Returns mtv_stage_vms: VM names whose evidence for stage `load_stage` has a
+# result in `load_results`. Used to carry outcomes between workflow nodes.
+- name: Common | Read {{ load_stage }} evidence for run {{ mtv_run_id }}
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    namespace: "{{ mtv_evidence_namespace }}"
+    label_selectors:
+      - "mtv.demo/run-id={{ mtv_run_id }}"
+      - "mtv.demo/stage={{ load_stage }}"
+      - "mtv.demo/result in ({{ load_results | join(',') }})"
+  register: _mtv_stage_cms
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Common | Collect VM names for {{ load_stage }}
+  ansible.builtin.set_fact:
+    mtv_stage_vms: "{{ _mtv_stage_cms.resources | mtv_cm_vms }}"
+  run_once: true

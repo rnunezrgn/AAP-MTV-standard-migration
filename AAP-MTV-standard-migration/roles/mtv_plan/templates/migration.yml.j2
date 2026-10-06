@@ -1,0 +1,13 @@
+apiVersion: forklift.konveyor.io/v1beta1
+kind: Migration
+metadata:
+  name: {{ _plan_name }}-migration
+  namespace: {{ mtv_namespace }}
+  labels:
+    app.kubernetes.io/part-of: aap-mtv-migration
+    mtv.demo/run-id: "{{ mtv_run_id }}"
+spec:
+  plan: { name: {{ _plan_name }}, namespace: {{ mtv_namespace }} }
+{% if _cutover | default('') %}
+  cutover: {{ _cutover | to_json }}
+{% endif %}

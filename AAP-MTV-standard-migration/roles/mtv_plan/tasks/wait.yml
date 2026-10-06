@@ -1,0 +1,40 @@
+---
+- name: Wait | Wait for each Plan to finish
+  kubernetes.core.k8s_info:
+    api_version: forklift.konveyor.io/v1beta1
+    kind: Plan
+    namespace: "{{ mtv_namespace }}"
+    name: "{{ item }}"
+  register: _done
+  until: >-
+    _done.resources[0].status.conditions | default([])
+    | selectattr('type', 'in', ['Succeeded', 'Failed', 'Canceled'])
+    | selectattr('status', 'equalto', 'True') | list | length > 0
+  retries: "{{ mtv_migration_wait_retries }}"
+  delay: "{{ mtv_migration_wait_delay }}"
+  loop: "{{ mtv_planned | map(attribute='plan') | unique | list }}"
+  failed_when: false
+
+- name: Wait | Collect per-VM outcomes
+  ansible.builtin.set_fact:
+    _vm_outcomes: "{{ _done.results | map(attribute='resources') | flatten | mtv_plan_vm_outcomes }}"
+
+- name: Wait | Record evidence per VM
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    ev_stage: migrate
+    ev_vm: "{{ _o.vm }}"
+    ev_checks: "{{ _o.checks }}"
+    ev_facts: "{{ _o.facts }}"
+  loop: "{{ _vm_outcomes }}"
+  loop_control:
+    loop_var: _o
+    label: "{{ _o.vm }}"
+
+- name: Wait | Fail the node when any VM did not migrate (workflow takes the rollback path)
+  ansible.builtin.assert:
+    that: _vm_outcomes | rejectattr('ok') | list | length == 0
+    fail_msg: "Not migrated: {{ _vm_outcomes | rejectattr('ok') | map(attribute='vm') | join(', ') }}"
+    quiet: true

@@ -1,0 +1,8 @@
+---
+# Workflow node 02: warm or cold, plan group and blockers for every VM.
+- name: "02 | Decide engine, mode and plan group"
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - mtv_common
+    - mtv_decide

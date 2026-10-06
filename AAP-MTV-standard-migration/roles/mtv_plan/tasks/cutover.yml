@@ -1,0 +1,43 @@
+---
+# Node 08: warm plans get a cutover time of "now"; cold plans get their
+# Migration now. Guest prep (BitLocker suspend, NIC binding) ran just before.
+- name: Cutover | Load plans
+  ansible.builtin.include_tasks: load_plans.yml
+
+- name: Cutover | Gracefully shut down cold-migration guests and wait for power-off
+  vmware.vmware.vm_powerstate:
+    datacenter: "{{ vcenter_datacenter }}"
+    moid: "{{ item.moid }}"
+    state: shutdown-guest
+    timeout: "{{ cold_shutdown_timeout }}"
+    validate_certs: "{{ vcenter_validate_certs }}"
+  loop: "{{ mtv_planned | rejectattr('warm') | list }}"
+  loop_control:
+    label: "{{ item.vm }}"
+  register: _shutdown
+  failed_when: false   # MTV powers the VM off itself if the guest does not respond
+  when: cold_graceful_shutdown | bool
+
+- name: Cutover | Set the cutover time on warm migrations
+  kubernetes.core.k8s:
+    state: patched
+    api_version: forklift.konveyor.io/v1beta1
+    kind: Migration
+    namespace: "{{ mtv_namespace }}"
+    name: "{{ item }}-migration"
+    merge_type: merge
+    definition:
+      spec:
+        cutover: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+  loop: "{{ mtv_planned | selectattr('warm') | map(attribute='plan') | unique | list }}"
+
+- name: Cutover | Start cold migrations
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('ansible.builtin.template', 'migration.yml.j2') | from_yaml }}"
+  loop: "{{ mtv_planned | rejectattr('warm') | map(attribute='plan') | unique | list }}"
+  loop_control:
+    loop_var: _plan_name
+
+- name: Cutover | Wait for completion
+  ansible.builtin.include_tasks: wait.yml

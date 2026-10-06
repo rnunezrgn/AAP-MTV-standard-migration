@@ -1,0 +1,30 @@
+apiVersion: forklift.konveyor.io/v1beta1
+kind: Plan
+metadata:
+  name: {{ _plan.name }}
+  namespace: {{ mtv_namespace }}
+  labels:
+    app.kubernetes.io/part-of: aap-mtv-migration
+    mtv.demo/run-id: "{{ mtv_run_id }}"
+    mtv.demo/mode: {{ 'warm' if _plan.warm else 'cold' }}
+spec:
+  description: "AAP run {{ mtv_run_id }}, {{ 'warm' if _plan.warm else 'cold' }}, standard path"
+  warm: {{ _plan.warm | bool | lower }}
+  targetNamespace: {{ mtv_target_namespace }}
+  preserveStaticIPs: {{ mtv_preserve_static_ips | bool | lower }}
+  targetPowerState: {{ mtv_target_power_state | to_json }}
+  provider:
+    source: { name: {{ mtv_source_provider }}, namespace: {{ mtv_source_provider_namespace }} }
+    destination: { name: {{ mtv_destination_provider }}, namespace: {{ mtv_destination_provider_namespace }} }
+  map:
+    network: { name: mtv-{{ mtv_run_id }}-network, namespace: {{ mtv_namespace }} }
+    storage: { name: mtv-{{ mtv_run_id }}-storage, namespace: {{ mtv_namespace }} }
+  vms:
+{% for vm in _plan.vms %}
+{% set src = mtv_decision_map[vm].source %}
+    - id: {{ src.moid | to_json }}
+      name: {{ vm | to_json }}
+{% if mtv_luks_secret and mtv_decision_map[vm].os == 'linux' %}
+      luks: { name: {{ mtv_luks_secret }}, namespace: {{ mtv_namespace }} }
+{% endif %}
+{% endfor %}

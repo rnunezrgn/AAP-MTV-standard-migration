@@ -1,0 +1,17 @@
+---
+# Reads one VM's evidence record for a stage into `mtv_evidence` (or {}).
+- name: Common | Read {{ ev_stage }} evidence for {{ ev_vm }}
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    namespace: "{{ mtv_evidence_namespace }}"
+    name: "mtv-ev-{{ mtv_run_id }}-{{ ev_stage }}-{{ ev_vm | mtv_dns(50) }}"
+  register: _mtv_one_ev
+  delegate_to: localhost
+  become: false
+
+- name: Common | Parse {{ ev_stage }} evidence for {{ ev_vm }}
+  ansible.builtin.set_fact:
+    mtv_evidence: >-
+      {{ (_mtv_one_ev.resources[0].data['evidence.json'] | from_json)
+         if _mtv_one_ev.resources | length else {} }}

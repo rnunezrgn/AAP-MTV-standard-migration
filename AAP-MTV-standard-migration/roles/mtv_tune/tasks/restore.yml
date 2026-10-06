@@ -1,0 +1,69 @@
+---
+- name: Restore MTV | Locate controller and backup
+  ansible.builtin.include_tasks: find.yml
+
+- name: Restore MTV | Nothing to restore
+  when: _backup.resources | length == 0
+  block:
+    - name: Restore MTV | Record that no backup existed
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: record
+      vars:
+        ev_stage: restore
+        ev_vm: platform
+        ev_checks:
+          - id: backup
+            title: Tuning backup found
+            status: warn
+            detail: "No backup for this run: tuning was never applied"
+
+    - name: Restore MTV | End
+      ansible.builtin.meta: end_play
+
+- name: Restore MTV | Put the original values back (absent keys are removed)
+  kubernetes.core.k8s:
+    state: patched
+    api_version: forklift.konveyor.io/v1beta1
+    kind: ForkliftController
+    name: "{{ _fc.resources[0].metadata.name }}"
+    namespace: "{{ mtv_namespace }}"
+    merge_type: merge
+    definition:
+      spec: "{{ _original }}"
+  vars:
+    _original: "{{ _backup.resources[0].data['original.json'] | from_json }}"
+
+- name: Restore MTV | Read back
+  kubernetes.core.k8s_info:
+    api_version: forklift.konveyor.io/v1beta1
+    kind: ForkliftController
+    name: "{{ _fc.resources[0].metadata.name }}"
+    namespace: "{{ mtv_namespace }}"
+  register: _after
+
+- name: Restore MTV | Record evidence
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    _original: "{{ _backup.resources[0].data['original.json'] | from_json }}"
+    _now: "{{ _after.resources[0].spec | mtv_pick(_original.keys() | list) }}"
+    ev_stage: restore
+    ev_vm: platform
+    ev_checks:
+      - id: restored
+        title: MTV values restored exactly
+        status: "{{ 'pass' if _now == _original else 'fail' }}"
+        detail: "expected {{ _original | to_json }}, found {{ _now | to_json }}"
+
+- name: Restore MTV | Remove the backup once verified
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: ConfigMap
+    namespace: "{{ mtv_evidence_namespace }}"
+    name: "mtv-tuning-backup-{{ mtv_run_id }}"
+  when: (_after.resources[0].spec | mtv_pick(_original.keys() | list)) == _original
+  vars:
+    _original: "{{ _backup.resources[0].data['original.json'] | from_json }}"

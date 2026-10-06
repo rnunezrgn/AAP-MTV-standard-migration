@@ -1,0 +1,200 @@
+---
+- name: "Target | {{ _vmname }} | Load decision and readiness"
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: load_evidence
+  vars:
+    ev_stage: readiness
+    ev_vm: "{{ _vmname }}"
+
+- name: "Target | {{ _vmname }} | Find the VM MTV created (label vmID)"
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    namespace: "{{ mtv_target_namespace }}"
+    label_selectors:
+      - "vmID={{ mtv_decision_map[_vmname].source.moid }}"
+  register: _by_label
+
+- name: "Target | {{ _vmname }} | Fall back to the converted name"
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    namespace: "{{ mtv_target_namespace }}"
+    name: "{{ _vmname | mtv_dns(63) }}"
+  register: _by_name
+  when: _by_label.resources | length == 0
+
+- name: "Target | {{ _vmname }} | Work out what the VM needs"
+  ansible.builtin.set_fact:
+    _tvm: "{{ (_by_label.resources + (_by_name.resources | default([]))) | first | default({}) }}"
+    _d: "{{ mtv_decision_map[_vmname] }}"
+    _ready: "{{ mtv_evidence.facts | default({}) }}"
+
+- name: "Target | {{ _vmname }} | Record a missing target VM"
+  when: not _tvm
+  block:
+    - name: "Target | {{ _vmname }} | Evidence"
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: record
+      vars:
+        ev_stage: target
+        ev_vm: "{{ _vmname }}"
+        ev_checks:
+          - id: found
+            title: Target VM found in OpenShift
+            status: fail
+            detail: "No VirtualMachine with vmID={{ _d.source.moid }} or name {{ _vmname | mtv_dns(63) }} in {{ mtv_target_namespace }}"
+
+- name: "Target | {{ _vmname }} | Harden and start"
+  when: _tvm
+  vars:
+    _dom: "{{ _tvm.spec.template.spec.domain }}"
+    _is_efi: "{{ _dom.firmware.bootloader.efi is defined }}"
+    _cur_sb: "{{ _dom.firmware.bootloader.efi.secureBoot | default(false) | bool }}"
+    _cur_tpm: "{{ _dom.devices.tpm.persistent | default(false) | bool }}"
+    _cur_efi_p: "{{ _dom.firmware.bootloader.efi.persistent | default(false) | bool }}"
+    _want_sb: "{{ target_enable_secure_boot | bool and _d.source.secure_boot | bool and _is_efi | bool }}"
+    _want_tpm: >-
+      {{ (_d.os == 'windows' and target_add_vtpm_windows | bool)
+         or (_d.os == 'linux' and (target_add_vtpm_linux | string | lower == 'true'
+             or (target_add_vtpm_linux | string | lower == 'auto'
+                 and (_d.source.has_vtpm or (_ready.clevis_tpm2 | default([]) | length > 0))))) }}
+    _want_efi_p: "{{ target_persistent_efi | bool and _want_tpm | bool and _is_efi | bool }}"
+    _patch: >-
+      {{ {}
+         | combine({'features': {'smm': {'enabled': true}},
+                    'firmware': {'bootloader': {'efi': {'secureBoot': true}}}}
+                   if (_want_sb | bool and not _cur_sb | bool) else {}, recursive=true)
+         | combine({'devices': {'tpm': {'persistent': true}}}
+                   if (_want_tpm | bool and not _cur_tpm | bool) else {}, recursive=true)
+         | combine({'firmware': {'bootloader': {'efi': {'persistent': true}}}}
+                   if (_want_efi_p | bool and not _cur_efi_p | bool) else {}, recursive=true) }}
+    _orig_rs: "{{ _tvm.spec.runStrategy | default('Always' if _tvm.spec.running | default(false) else 'Halted') }}"
+    _final_rs: "{{ _orig_rs if _orig_rs in ['Always', 'RerunOnFailure'] else 'Always' }}"
+  block:
+    - name: "Target | {{ _vmname }} | Stop before changing firmware or TPM"
+      kubernetes.core.k8s:
+        state: patched
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ _tvm.metadata.name }}"
+        namespace: "{{ _tvm.metadata.namespace }}"
+        merge_type: merge
+        definition:
+          spec:
+            running: null
+            runStrategy: Halted
+      when: _patch | length > 0
+
+    - name: "Target | {{ _vmname }} | Wait for the VMI to stop"
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ _tvm.metadata.name }}"
+        namespace: "{{ _tvm.metadata.namespace }}"
+      register: _vmi_gone
+      until: _vmi_gone.resources | length == 0
+      retries: 60
+      delay: 5
+      when: _patch | length > 0
+
+    - name: "Target | {{ _vmname }} | Add Secure Boot, persistent vTPM and EFI as needed"
+      kubernetes.core.k8s:
+        state: patched
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ _tvm.metadata.name }}"
+        namespace: "{{ _tvm.metadata.namespace }}"
+        merge_type: merge
+        definition:
+          spec:
+            template:
+              spec:
+                domain: "{{ _patch }}"
+      when: _patch | length > 0
+
+    - name: "Target | {{ _vmname }} | Start"
+      kubernetes.core.k8s:
+        state: patched
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ _tvm.metadata.name }}"
+        namespace: "{{ _tvm.metadata.namespace }}"
+        merge_type: merge
+        definition:
+          spec:
+            running: null
+            runStrategy: "{{ _final_rs }}"
+
+    - name: "Target | {{ _vmname }} | Wait for Running and the guest agent"
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ _tvm.metadata.name }}"
+        namespace: "{{ _tvm.metadata.namespace }}"
+      register: _vmi
+      until: >-
+        _vmi.resources | length > 0 and _vmi.resources[0].status.phase | default('') == 'Running'
+        and (_vmi.resources[0].status.conditions | default([])
+             | selectattr('type', 'equalto', 'AgentConnected') | selectattr('status', 'equalto', 'True') | list | length > 0)
+      retries: "{{ target_agent_retries }}"
+      delay: 10
+      failed_when: false
+
+    - name: "Target | {{ _vmname }} | Read the final VM spec"
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ _tvm.metadata.name }}"
+        namespace: "{{ _tvm.metadata.namespace }}"
+      register: _final
+
+    - name: "Target | {{ _vmname }} | Record evidence"
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: record
+      vars:
+        _fdom: "{{ _final.resources[0].spec.template.spec.domain }}"
+        _vmi_s: "{{ (_vmi.resources | default([{}]) | first).status | default({}) }}"
+        _agent: >-
+          {{ _vmi_s.conditions | default([]) | selectattr('type', 'equalto', 'AgentConnected')
+             | selectattr('status', 'equalto', 'True') | list | length > 0 }}
+        _tips: "{{ _vmi_s.interfaces | default([]) | map(attribute='ipAddresses') | select('defined') | flatten | list }}"
+        _missing_ips: "{{ _d.source.ips | reject('in', _tips) | list }}"
+        ev_stage: target
+        ev_vm: "{{ _vmname }}"
+        ev_checks:
+          - id: found
+            title: Target VM found in OpenShift
+            status: pass
+            detail: "{{ _tvm.metadata.namespace }}/{{ _tvm.metadata.name }}"
+          - id: secure_boot
+            title: Secure Boot matches the source
+            status: >-
+              {{ 'pass' if (_fdom.firmware.bootloader.efi.secureBoot | default(false) | bool) == (_want_sb | bool)
+                 else 'fail' }}
+            detail: >-
+              source {{ 'on' if _d.source.secure_boot else 'off' }},
+              target {{ 'on' if _fdom.firmware.bootloader.efi.secureBoot | default(false) else 'off' }}
+          - id: vtpm
+            title: Persistent vTPM present where needed
+            status: "{{ 'pass' if (not _want_tpm | bool) or (_fdom.devices.tpm.persistent | default(false) | bool) else 'fail' }}"
+            detail: "{{ 'persistent vTPM added' if _fdom.devices.tpm.persistent | default(false) else 'not required' }}"
+          - id: running
+            title: VM running with the guest agent connected
+            status: "{{ 'pass' if _agent | bool else 'fail' }}"
+            detail: >-
+              phase {{ _vmi_s.phase | default('unknown') }},
+              agent {{ 'connected' if _agent | bool else 'not connected' }},
+              {{ _vmi_s.guestOSInfo.prettyName | default('') }}
+          - id: ip_preserved
+            title: Source IP addresses present on the target
+            status: "{{ 'pass' if not _missing_ips else 'warn' }}"
+            detail: "{{ ('missing ' ~ (_missing_ips | join(', '))) if _missing_ips else (_tips | join(', ') or 'n/a') }}"
+        ev_facts:
+          name: "{{ _tvm.metadata.name }}"
+          namespace: "{{ _tvm.metadata.namespace }}"
+          patched: "{{ _patch }}"
+          ips: "{{ _tips }}"

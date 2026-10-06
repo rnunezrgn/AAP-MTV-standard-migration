@@ -1,0 +1,8 @@
+---
+# Workflow node 01: read every requested VM from vCenter.
+- name: "01 | Discover source VMs"
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - mtv_common
+    - mtv_discover

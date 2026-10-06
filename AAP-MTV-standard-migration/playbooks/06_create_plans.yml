@@ -1,0 +1,16 @@
+---
+# Workflow node 06: StorageMap, NetworkMap and Plans; warm precopies start now.
+- name: "06 | Create MTV plans and start warm precopies"
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Load decisions
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: load_run
+
+    - name: Create plans
+      ansible.builtin.include_role:
+        name: mtv_plan

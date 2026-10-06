@@ -1,0 +1,16 @@
+---
+# Workflow node 04: go / no-go list and the pre-check report the approver reads.
+- name: "04 | Pre-check report and gate"
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Load decisions
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: load_run
+
+    - name: Gate
+      ansible.builtin.include_role:
+        name: mtv_gate

@@ -1,0 +1,61 @@
+{% set drv = _virtio.stdout_lines | default([]) %}
+{% set pre_ips = _pre.ipv4 | default([]) %}
+{% set lost_ips = pre_ips | reject('in', ansible_facts.all_ipv4_addresses | default([])) | list %}
+{% set sb_now = 'enabled' in (_sb.stdout | default('')) %}
+{% set ovt_left = ansible_facts.packages.keys() | select('match', '^open-vm-tools') | list if _ovt is skipped else [] %}
+- id: virtio_storage
+  title: VirtIO storage driver in use
+  status: {{ 'pass' if 'virtio_blk' in drv or 'virtio_scsi' in drv else 'fail' }}
+  detail: {{ (drv | join(', ') or 'no virtio drivers bound') | to_json }}
+- id: virtio_network
+  title: VirtIO network driver in use
+  status: {{ 'pass' if 'virtio_net' in drv else 'fail' }}
+  detail: {{ ('virtio_net bound' if 'virtio_net' in drv else 'virtio_net not bound') | to_json }}
+- id: guest_agent
+  title: qemu-guest-agent enabled and running
+  status: {{ 'pass' if _qga is succeeded and _qga.status.ActiveState | default('') == 'active' else 'fail' }}
+  detail: {{ (_qga.status.ActiveState | default(_qga.msg | default('unknown'))) | to_json }}
+- id: vmware_tools
+  title: open-vm-tools removed
+  status: {{ 'pass' if not ovt_left else 'fail' }}
+  detail: {{ ('removed ' ~ (_ovt.results | default([]) | length) if _ovt is changed else ('not installed' if _ovt is skipped else 'unchanged')) | to_json }}
+- id: mounts
+  title: fstab entries resolve (findmnt --verify)
+  status: {{ 'pass' if _findmnt.rc == 0 else 'fail' }}
+  detail: {{ (_findmnt.stdout_lines | last | default('ok')) | to_json }}
+- id: failed_units
+  title: No failed systemd units
+  status: {{ 'pass' if not _failed_units.stdout_lines else 'warn' }}
+  detail: {{ (_failed_units.stdout_lines | map('split') | map('first') | join(', ') or 'none') | to_json }}
+- id: ip_preserved
+  title: IP addresses preserved
+  status: {{ 'pass' if not lost_ips else 'fail' }}
+  detail: {{ (('missing ' ~ (lost_ips | join(', '))) if lost_ips else (ansible_facts.all_ipv4_addresses | default([]) | join(', '))) | to_json }}
+- id: gateway
+  title: Default gateway unchanged
+  status: {{ 'pass' if (_pre.default_gw | default('')) == (ansible_facts.default_ipv4.gateway | default('')) else 'fail' }}
+  detail: {{ ('before ' ~ _pre.default_gw | default('-') ~ ', after ' ~ ansible_facts.default_ipv4.gateway | default('-')) | to_json }}
+- id: dns
+  title: DNS servers unchanged
+  status: {{ 'pass' if (_pre.dns | default([]) | sort) == (ansible_facts.dns.nameservers | default([]) | sort) else 'warn' }}
+  detail: {{ (ansible_facts.dns.nameservers | default([]) | join(', ')) | to_json }}
+- id: selinux
+  title: SELinux mode unchanged, no denials since boot
+  status: {{ 'fail' if (_pre.selinux_mode | default('')) != (ansible_facts.selinux.mode | default('disabled')) else ('warn' if _avc.stdout | int > 0 else 'pass') }}
+  detail: {{ ('mode ' ~ ansible_facts.selinux.mode | default('disabled') ~ ', ' ~ _avc.stdout ~ ' AVC denial(s) since boot') | to_json }}
+- id: secure_boot
+  title: Secure Boot unchanged
+  status: {{ 'pass' if (_pre.secure_boot | default(false) | bool) == sb_now else 'fail' }}
+  detail: {{ ('before ' ~ ('on' if _pre.secure_boot | default(false) | bool else 'off') ~ ', after ' ~ ('on' if sb_now else 'off')) | to_json }}
+- id: luks
+  title: Encrypted volumes unlocked and Clevis re-bound
+{% if not _pre.luks | default([]) %}
+  status: pass
+  detail: "no LUKS volumes"
+{% elif _pre.clevis_tpm2 | default([]) and not (linux_rebind_clevis | bool and luks_passphrase is defined) %}
+  status: warn
+  detail: "Clevis TPM2 still bound to the VMware vTPM: re-bind with linux_rebind_clevis and a LUKS passphrase credential"
+{% else %}
+  status: pass
+  detail: {{ ((_pre.luks | join(', ')) ~ ' unlocked' ~ (', Clevis TPM2 re-bound' if _pre.clevis_tpm2 | default([]) else '')) | to_json }}
+{% endif %}

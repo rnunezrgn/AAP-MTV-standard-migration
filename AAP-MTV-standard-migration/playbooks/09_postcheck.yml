@@ -1,0 +1,61 @@
+---
+# Workflow node 09: harden the target VMs, then prove, clean and re-seal each guest.
+- name: "09 | Post-check | Target VMs on OpenShift Virtualization"
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Load decisions
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: load_run
+
+    - name: Harden and start target VMs
+      ansible.builtin.include_role:
+        name: mtv_target
+
+    - name: Which target VMs are ready for guest checks
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: load_stage
+      vars:
+        load_stage: target
+        load_results: [pass, warn]
+
+    - name: Keep the list for the guest plays
+      ansible.builtin.set_fact:
+        mtv_post_vms: "{{ mtv_stage_vms }}"
+
+- name: "09 | Post-check | Windows guests"
+  hosts: windows_guests
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Only migrated Windows VMs
+      ansible.builtin.meta: end_host
+      when: >-
+        mtv_vm not in hostvars['localhost'].mtv_post_vms | default([])
+        or mtv_vm not in hostvars['localhost'].mtv_eligible_windows | default([])
+
+    - name: Windows post-check
+      ansible.builtin.include_role:
+        name: mtv_win_postcheck
+
+- name: "09 | Post-check | Linux guests"
+  hosts: linux_guests
+  gather_facts: false
+  become: true
+  roles:
+    - mtv_common
+  tasks:
+    - name: Only migrated Linux VMs
+      ansible.builtin.meta: end_host
+      when: >-
+        mtv_vm not in hostvars['localhost'].mtv_post_vms | default([])
+        or mtv_vm not in hostvars['localhost'].mtv_eligible_linux | default([])
+
+    - name: Linux post-check
+      ansible.builtin.include_role:
+        name: mtv_linux_postcheck

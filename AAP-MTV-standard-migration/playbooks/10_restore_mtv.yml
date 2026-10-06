@@ -1,0 +1,12 @@
+---
+# Workflow node 10: put MTV back exactly as it was. Runs on every path.
+- name: "10 | Restore MTV settings"
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Restore tuning
+      ansible.builtin.include_role:
+        name: mtv_tune
+        tasks_from: restore

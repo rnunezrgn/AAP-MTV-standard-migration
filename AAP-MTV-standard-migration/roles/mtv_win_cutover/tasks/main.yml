@@ -1,0 +1,42 @@
+---
+# Runs right before cutover. For warm plans the VM is still running on VMware,
+# so the final delta carries the suspended BitLocker state.
+- name: Windows cutover prep | Reachability
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: reach
+  vars:
+    reach_stage: cutover_prep
+
+- name: Windows cutover prep | Stop application services
+  ansible.windows.win_service:
+    name: "{{ item }}"
+    state: stopped
+  loop: "{{ win_stop_services_before_cutover }}"
+  register: _stopped
+
+- name: Windows cutover prep | Suspend BitLocker until resumed explicitly
+  ansible.windows.win_powershell:
+    script: "{{ lookup('ansible.builtin.file', mtv_scripts_dir ~ '/Suspend-BitLockerForMigration.ps1') }}"
+  register: _suspend
+
+- name: Windows cutover prep | Record evidence
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    ev_stage: cutover_prep
+    ev_vm: "{{ mtv_vm }}"
+    ev_checks:
+      - id: bitlocker_suspended
+        title: BitLocker suspended (RebootCount 0)
+        status: "{{ 'fail' if _suspend.result | rejectattr('protection', 'equalto', 'Off') | list else 'pass' }}"
+        detail: >-
+          {{ (_suspend.result | map(attribute='mount') | join(', ') ~ ' suspended')
+             if _suspend.result else 'no protected volumes' }}
+      - id: services_stopped
+        title: Application services stopped
+        status: "{{ 'pass' if win_stop_services_before_cutover else 'info' }}"
+        detail: "{{ win_stop_services_before_cutover | join(', ') or 'none configured' }}"
+    ev_facts:
+      suspended: "{{ _suspend.result }}"

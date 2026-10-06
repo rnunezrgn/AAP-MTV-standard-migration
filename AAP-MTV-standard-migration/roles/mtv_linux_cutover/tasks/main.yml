@@ -1,0 +1,69 @@
+---
+- name: Linux cutover prep | Reachability
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: reach
+  vars:
+    reach_stage: cutover_prep
+
+- name: Linux cutover prep | Gather network facts
+  ansible.builtin.setup:
+    gather_subset: [min, network]
+
+- name: Linux cutover prep | List NetworkManager profiles bound to an interface name
+  ansible.builtin.shell: |
+    set -o pipefail
+    command -v nmcli >/dev/null || exit 0
+    nmcli -t -f UUID,TYPE con show | awk -F: '$2=="802-3-ethernet"{print $1}' | while read -r u; do
+      printf '%s|%s|%s|%s\n' "$u" "$(nmcli -g connection.id con show "$u")" \
+        "$(nmcli -g connection.interface-name con show "$u")" \
+        "$(nmcli -g 802-3-ethernet.mac-address con show "$u" | tr -d '\\')"
+    done
+  args:
+    executable: /bin/bash
+  register: _nm
+  changed_when: false
+
+- name: Linux cutover prep | Bind profiles to the MAC so the renamed VirtIO NIC still matches
+  ansible.builtin.command: >-
+    nmcli con mod {{ item.uuid }}
+    802-3-ethernet.mac-address {{ ansible_facts[item.ifname | replace('-', '_')].macaddress }}
+    connection.interface-name ""
+  loop: >-
+    {{ _nm.stdout_lines | map('mtv_nm_profile') | selectattr('ifname')
+       | selectattr('ifname', 'in', ansible_facts.interfaces) | list }}
+  loop_control:
+    label: "{{ item.name }} ({{ item.ifname }})"
+  register: _bound
+  changed_when: true
+  when: linux_bind_nm_to_mac | bool
+  become: true
+
+- name: Linux cutover prep | Stop application services
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: stopped
+  loop: "{{ linux_stop_services_before_cutover }}"
+  become: true
+
+- name: Linux cutover prep | Flush filesystem buffers
+  ansible.builtin.command: sync
+  changed_when: false
+
+- name: Linux cutover prep | Record evidence
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    _n: "{{ _bound.results | default([]) | rejectattr('skipped', 'defined') | list }}"
+    ev_stage: cutover_prep
+    ev_vm: "{{ mtv_vm }}"
+    ev_checks:
+      - id: nic_binding
+        title: NetworkManager profiles bound to MAC
+        status: "{{ 'fail' if _n | selectattr('failed') | list else 'pass' }}"
+        detail: "{{ (_n | map(attribute='item.name') | join(', ') ~ ' re-bound') if _n else 'nothing to change' }}"
+      - id: services_stopped
+        title: Application services stopped
+        status: "{{ 'pass' if linux_stop_services_before_cutover else 'info' }}"
+        detail: "{{ linux_stop_services_before_cutover | join(', ') or 'none configured' }}"

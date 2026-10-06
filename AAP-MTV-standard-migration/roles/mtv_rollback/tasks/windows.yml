@@ -1,0 +1,33 @@
+---
+# Node 90, Windows play: the VM is back on its original vTPM, so resume BitLocker.
+- name: Rollback | Reachability
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: reach
+  vars:
+    reach_stage: rollback
+
+- name: Rollback | Resume BitLocker
+  ansible.windows.win_powershell:
+    script: "{{ lookup('ansible.builtin.file', mtv_scripts_dir ~ '/Resume-BitLockerAfterRollback.ps1') }}"
+  register: _resume
+
+- name: Rollback | Read the rollback evidence written by the controller play
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: load_evidence
+  vars:
+    ev_stage: rollback
+    ev_vm: "{{ mtv_vm }}"
+
+- name: Rollback | Add the guest result to the evidence
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    ev_stage: rollback
+    ev_vm: "{{ mtv_vm }}"
+    ev_checks: >-
+      {{ mtv_evidence.checks | default([]) + [{
+           'id': 'bitlocker_resumed', 'title': 'BitLocker protection resumed on VMware', 'status': 'pass',
+           'detail': (_resume.result | join(', ') ~ ' resumed') if _resume.result else 'nothing was suspended'}] }}

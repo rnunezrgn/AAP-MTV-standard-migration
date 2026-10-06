@@ -1,0 +1,42 @@
+---
+# Workflow node 03: guest pre-checks and safe preparation (VirtIO staging,
+# BitLocker escrow). Nothing here stops a guest or changes its boot.
+- name: "03 | Readiness | Load the run"
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Load decisions
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: load_run
+
+- name: "03 | Readiness | Windows guests"
+  hosts: windows_guests
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Only this run's eligible Windows VMs
+      ansible.builtin.meta: end_host
+      when: mtv_vm not in hostvars['localhost'].mtv_eligible_windows | default([])
+
+    - name: Windows readiness
+      ansible.builtin.include_role:
+        name: mtv_win_readiness
+
+- name: "03 | Readiness | Linux guests"
+  hosts: linux_guests
+  gather_facts: false
+  become: true
+  roles:
+    - mtv_common
+  tasks:
+    - name: Only this run's eligible Linux VMs
+      ansible.builtin.meta: end_host
+      when: mtv_vm not in hostvars['localhost'].mtv_eligible_linux | default([])
+
+    - name: Linux readiness
+      ansible.builtin.include_role:
+        name: mtv_linux_readiness

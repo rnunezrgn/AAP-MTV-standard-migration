@@ -1,0 +1,111 @@
+---
+- name: Linux readiness | Reachability
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: reach
+  vars:
+    reach_stage: readiness
+
+- name: Linux readiness | Gather facts
+  ansible.builtin.setup:
+    gather_subset: [min, network, hardware, virtual, selinux]
+
+- name: Linux readiness | Gather package facts
+  ansible.builtin.package_facts:
+
+- name: Linux readiness | Check VirtIO drivers exist for the running kernel
+  ansible.builtin.shell: |
+    for m in virtio_blk virtio_scsi virtio_net virtio_pci; do
+      modinfo -n "$m" >/dev/null 2>&1 \
+        || grep -q "/$m.ko" "/lib/modules/$(uname -r)/modules.builtin" 2>/dev/null \
+        || echo "$m"
+    done
+  args:
+    executable: /bin/bash
+  register: _virtio_missing
+  changed_when: false
+
+- name: Linux readiness | Read fstab
+  ansible.builtin.slurp:
+    src: /etc/fstab
+  register: _fstab
+
+- name: Linux readiness | Look for sdX paths in LVM filters and the kernel command line
+  ansible.builtin.shell: |
+    grep -E '^\s*(global_)?filter\s*=.*sd' /etc/lvm/lvm.conf 2>/dev/null || true
+    grep -Eo 'root=/dev/sd[a-z]+[0-9]*' /proc/cmdline 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  register: _sd_refs
+  changed_when: false
+
+- name: Linux readiness | List NetworkManager ethernet profiles
+  ansible.builtin.shell: |
+    set -o pipefail
+    command -v nmcli >/dev/null || { echo "NO_NM"; exit 0; }
+    nmcli -t -f UUID,TYPE con show | awk -F: '$2=="802-3-ethernet"{print $1}' | while read -r u; do
+      printf '%s|%s|%s|%s\n' "$u" "$(nmcli -g connection.id con show "$u")" \
+        "$(nmcli -g connection.interface-name con show "$u")" \
+        "$(nmcli -g 802-3-ethernet.mac-address con show "$u" | tr -d '\\')"
+    done
+  args:
+    executable: /bin/bash
+  register: _nm
+  changed_when: false
+
+- name: Linux readiness | Secure Boot state
+  ansible.builtin.command: mokutil --sb-state
+  register: _sb
+  changed_when: false
+  failed_when: false
+
+- name: Linux readiness | Block devices
+  ansible.builtin.command: lsblk -J -p -o NAME,FSTYPE,TYPE
+  register: _lsblk
+  changed_when: false
+
+- name: Linux readiness | Clevis bindings on LUKS devices
+  ansible.builtin.command: "clevis luks list -d {{ item }}"
+  loop: "{{ _lsblk.stdout | mtv_lsblk_luks }}"
+  register: _clevis
+  changed_when: false
+  failed_when: false
+
+- name: Linux readiness | qemu-guest-agent installed or installable  # noqa: command-instead-of-module
+  ansible.builtin.shell: rpm -q qemu-guest-agent || dnf -q list --available qemu-guest-agent || yum -q list available qemu-guest-agent
+  register: _qga
+  changed_when: false
+  failed_when: false
+
+- name: Linux readiness | Parse results
+  ansible.builtin.set_fact:
+    _luks_devs: "{{ _lsblk.stdout | mtv_lsblk_luks }}"
+    _profiles: "{{ _nm.stdout_lines | reject('equalto', 'NO_NM') | map('mtv_nm_profile') | list }}"
+    _clevis_tpm2: "{{ _clevis.results | default([]) | map('mtv_clevis_tpm2') | select | list }}"
+    _fstab_sd: "{{ _fstab.content | b64decode | regex_findall('(?m)^\\s*(/dev/sd[a-z]+[0-9]*)\\s') }}"
+
+- name: Linux readiness | Evaluate checks
+  ansible.builtin.set_fact:
+    _checks: "{{ lookup('ansible.builtin.template', 'readiness_checks.yml.j2') | from_yaml }}"
+
+- name: Linux readiness | Record evidence
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    ev_stage: readiness
+    ev_vm: "{{ mtv_vm }}"
+    ev_checks: "{{ _checks }}"
+    ev_facts:
+      os_family: linux
+      distribution: "{{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}"
+      kernel: "{{ ansible_facts.kernel }}"
+      ipv4: "{{ ansible_facts.all_ipv4_addresses | default([]) | sort }}"
+      default_gw: "{{ ansible_facts.default_ipv4.gateway | default('') }}"
+      dns: "{{ ansible_facts.dns.nameservers | default([]) }}"
+      selinux_mode: "{{ ansible_facts.selinux.mode | default('disabled') }}"
+      secure_boot: "{{ 'enabled' in (_sb.stdout | default('')) }}"
+      nm_profiles: "{{ _profiles }}"
+      luks: "{{ _luks_devs }}"
+      clevis_tpm2: "{{ _clevis_tpm2 }}"
+      open_vm_tools: "{{ 'open-vm-tools' in ansible_facts.packages }}"

@@ -1,0 +1,217 @@
+---
+# AAP objects for the standard-path migration workflow, as code.
+# Load with:  ansible-playbook aap/apply.yml -e @aap/controller_config.yml
+# (needs infra.aap_configuration and ansible.platform / ansible.controller)
+_org: &org Default
+_ee: &ee MTV migration EE
+_project: &project AAP MTV standard migration
+_inventory: &inventory MTV migration guests
+
+controller_execution_environments:
+  - name: *ee
+    image: registry.example.com/ee-mtv-migration:1.0
+    pull: missing
+    organization: *org
+
+controller_credential_types:
+  - name: Windows WinRM (MTV)
+    kind: cloud
+    description: Windows guest login kept separate from the Linux machine credential
+    inputs:
+      fields:
+        - { id: username, type: string, label: Username }
+        - { id: password, type: string, label: Password, secret: true }
+      required: [username, password]
+    injectors:
+      extra_vars:
+        win_ansible_user: "{{ '{{' }} username {{ '}}' }}"
+        win_ansible_password: "{{ '{{' }} password {{ '}}' }}"
+  - name: LUKS passphrase (MTV)
+    kind: cloud
+    description: Passphrase used to re-bind Clevis TPM2 slots after migration
+    inputs:
+      fields:
+        - { id: passphrase, type: string, label: LUKS passphrase, secret: true }
+      required: [passphrase]
+    injectors:
+      extra_vars:
+        luks_passphrase: "{{ '{{' }} passphrase {{ '}}' }}"
+
+controller_credentials:
+  - name: MTV vCenter
+    credential_type: VMware vCenter
+    organization: *org
+    inputs: { host: vcenter.example.com, username: svc-mtv@vsphere.local, password: CHANGE_ME }
+  - name: MTV OpenShift API
+    credential_type: OpenShift or Kubernetes API Bearer Token
+    organization: *org
+    inputs: { host: "https://api.ocp.example.com:6443", bearer_token: CHANGE_ME, verify_ssl: true }
+  - name: MTV Linux guests
+    credential_type: Machine
+    organization: *org
+    inputs: { username: ansible, ssh_key_data: CHANGE_ME, become_method: sudo }
+  - name: MTV Windows guests
+    credential_type: Windows WinRM (MTV)
+    organization: *org
+    inputs: { username: 'EXAMPLE\svc-ansible', password: CHANGE_ME }
+  - name: MTV LUKS passphrase
+    credential_type: LUKS passphrase (MTV)
+    organization: *org
+    inputs: { passphrase: CHANGE_ME }
+
+controller_projects:
+  - name: *project
+    organization: *org
+    scm_type: git
+    scm_url: https://git.example.com/infra/aap-mtv-standard-migration.git
+    scm_branch: main
+    scm_update_on_launch: true
+    default_environment: *ee
+
+controller_inventories:
+  - name: *inventory
+    organization: *org
+
+controller_inventory_sources:
+  - name: MTV guests from project
+    inventory: *inventory
+    source: scm
+    source_project: *project
+    source_path: inventory/hosts.yml
+    overwrite: true
+    update_on_launch: true
+
+# One job template per workflow node. All share project, inventory and EE.
+_jt: &jt
+  organization: *org
+  project: *project
+  inventory: *inventory
+  execution_environment: *ee
+  ask_variables_on_launch: true
+  verbosity: 0
+
+controller_templates:
+  - { <<: *jt, name: "MTV | 01 Discover",          playbook: playbooks/01_discover.yml,         credentials: [MTV OpenShift API, MTV vCenter] }
+  - { <<: *jt, name: "MTV | 02 Decide",            playbook: playbooks/02_decide.yml,           credentials: [MTV OpenShift API] }
+  - { <<: *jt, name: "MTV | 03 Guest readiness",   playbook: playbooks/03_readiness.yml,        credentials: [MTV OpenShift API, MTV Linux guests, MTV Windows guests] }
+  - { <<: *jt, name: "MTV | 04 Pre-check report",  playbook: playbooks/04_precheck_report.yml,  credentials: [MTV OpenShift API] }
+  - { <<: *jt, name: "MTV | 05 Tune MTV",          playbook: playbooks/05_tune_mtv.yml,         credentials: [MTV OpenShift API] }
+  - { <<: *jt, name: "MTV | 06 Create plans",      playbook: playbooks/06_create_plans.yml,     credentials: [MTV OpenShift API] }
+  - { <<: *jt, name: "MTV | 07 Cutover prep",      playbook: playbooks/07_cutover_prep.yml,     credentials: [MTV OpenShift API, MTV Linux guests, MTV Windows guests] }
+  - { <<: *jt, name: "MTV | 08 Execute cutover",   playbook: playbooks/08_execute_cutover.yml,  credentials: [MTV OpenShift API, MTV vCenter] }
+  - { <<: *jt, name: "MTV | 09 Post-check",        playbook: playbooks/09_postcheck.yml,        credentials: [MTV OpenShift API, MTV Linux guests, MTV Windows guests, MTV LUKS passphrase] }
+  - { <<: *jt, name: "MTV | 10 Restore MTV",       playbook: playbooks/10_restore_mtv.yml,      credentials: [MTV OpenShift API] }
+  - { <<: *jt, name: "MTV | 11 Report",            playbook: playbooks/11_report.yml,           credentials: [MTV OpenShift API] }
+  - { <<: *jt, name: "MTV | 90 Rollback",          playbook: playbooks/90_rollback.yml,         credentials: [MTV OpenShift API, MTV vCenter, MTV Windows guests] }
+
+controller_workflows:
+  - name: MTV | Standard migration with approvals
+    description: Discover, decide, pre-check, approve, migrate, approve cutover, post-check, report
+    organization: *org
+    inventory: *inventory
+    allow_simultaneous: false
+    ask_variables_on_launch: false
+    destroy_current_nodes: true
+    survey_enabled: true
+    survey_spec:
+      name: Migration run
+      description: VMs and mode for this run
+      spec:
+        - question_name: VMs to migrate
+          question_description: vCenter VM names, one per line
+          variable: migration_vms
+          type: textarea
+          required: true
+        - question_name: Migration mode
+          question_description: auto picks warm for large VMs with CBT, cold otherwise
+          variable: migration_mode
+          type: multiplechoice
+          choices: [auto, warm, cold]
+          default: auto
+          required: true
+        - question_name: Target namespace
+          variable: mtv_target_namespace
+          type: text
+          default: migrated-vms
+          required: true
+        - question_name: BitLocker escrow
+          question_description: Where recovery passwords are escrowed before migration
+          variable: bitlocker_escrow_method
+          type: multiplechoice
+          choices: [ad, aad, none]
+          default: ad
+          required: true
+    simplified_workflow_nodes:
+      - identifier: n01_discover
+        unified_job_template: "MTV | 01 Discover"
+        success_nodes: [n02_decide]
+      - identifier: n02_decide
+        unified_job_template: "MTV | 02 Decide"
+        success_nodes: [n03_readiness]
+      - identifier: n03_readiness
+        unified_job_template: "MTV | 03 Guest readiness"
+        always_nodes: [n04_precheck]        # report even if a guest was unreachable
+      - identifier: n04_precheck
+        unified_job_template: "MTV | 04 Pre-check report"
+        success_nodes: [a1_go_nogo]
+      # ---------------- APPROVAL 1 ----------------
+      - identifier: a1_go_nogo
+        approval_node:
+          name: "Approve migration: review pre-check report"
+          description: >-
+            Read the decision table (node 02) and the pre-check report
+            (ConfigMap mtv-report-<run>-pre). Approve to tune MTV, create plans
+            and start warm precopies. Deny to stop with a report.
+          timeout: 86400
+        success_nodes: [n05_tune]
+        failure_nodes: [n11_report]          # denied or timed out
+      - identifier: n05_tune
+        unified_job_template: "MTV | 05 Tune MTV"
+        success_nodes: [n06_plans]
+        failure_nodes: [n10_restore]
+      - identifier: n06_plans
+        unified_job_template: "MTV | 06 Create plans"
+        success_nodes: [a2_cutover]
+        failure_nodes: [n90_rollback]
+      # ---------------- APPROVAL 2 ----------------
+      - identifier: a2_cutover
+        approval_node:
+          name: "Approve cutover: change window open"
+          description: >-
+            Warm precopies are running. Approve inside the change window to
+            suspend BitLocker, stop services and cut over. Deny or let it time
+            out to cancel and leave the VMs on VMware.
+          timeout: 28800
+        success_nodes: [n07_prep]
+        failure_nodes: [n90_rollback]
+      - identifier: n07_prep
+        unified_job_template: "MTV | 07 Cutover prep"
+        success_nodes: [n08_cutover]
+        failure_nodes: [n90_rollback]
+      - identifier: n08_cutover
+        unified_job_template: "MTV | 08 Execute cutover"
+        success_nodes: [n09_postcheck]
+        failure_nodes: [n90_rollback]
+      - identifier: n09_postcheck
+        unified_job_template: "MTV | 09 Post-check"
+        always_nodes: [n10_restore]
+      - identifier: n90_rollback
+        unified_job_template: "MTV | 90 Rollback"
+        always_nodes: [n10_restore]
+      - identifier: n10_restore
+        unified_job_template: "MTV | 10 Restore MTV"
+        always_nodes: [n11_report]
+      - identifier: n11_report
+        unified_job_template: "MTV | 11 Report"
+    notification_templates_approvals: []   # add a Slack/email template here
+    notification_templates_error: []
+    notification_templates_success: []
+
+# Who can approve: give a team the approval role on the workflow.
+controller_roles:
+  - team: Migration approvers
+    workflows: ["MTV | Standard migration with approvals"]
+    role: approval
+  - team: Migration operators
+    workflows: ["MTV | Standard migration with approvals"]
+    role: execute

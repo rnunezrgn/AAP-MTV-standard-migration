@@ -1,0 +1,27 @@
+---
+# Ends the host cleanly, with evidence, when the guest cannot be reached.
+# Input: reach_stage
+- name: Guest | Check {{ mtv_vm }} is reachable
+  ansible.builtin.wait_for_connection:
+    timeout: "{{ guest_connect_timeout }}"
+  register: _reach
+  ignore_errors: true
+  ignore_unreachable: true
+
+- name: Guest | Record that {{ mtv_vm }} is unreachable
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    ev_stage: "{{ reach_stage }}"
+    ev_vm: "{{ mtv_vm }}"
+    ev_checks:
+      - id: reachable
+        title: Guest reachable from AAP
+        status: fail
+        detail: "{{ _reach.msg | default('unreachable') }}"
+  when: _reach is failed or _reach is unreachable
+
+- name: Guest | Stop here for {{ mtv_vm }}
+  ansible.builtin.meta: end_host
+  when: _reach is failed or _reach is unreachable

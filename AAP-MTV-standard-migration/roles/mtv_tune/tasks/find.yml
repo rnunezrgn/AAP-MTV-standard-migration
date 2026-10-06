@@ -1,0 +1,21 @@
+---
+- name: Tune MTV | Find the ForkliftController
+  kubernetes.core.k8s_info:
+    api_version: forklift.konveyor.io/v1beta1
+    kind: ForkliftController
+    namespace: "{{ mtv_namespace }}"
+  register: _fc
+
+- name: Tune MTV | Exactly one ForkliftController is expected
+  ansible.builtin.assert:
+    that: _fc.resources | length == 1
+    fail_msg: "Expected one ForkliftController in {{ mtv_namespace }}, found {{ _fc.resources | length }}"
+    quiet: true
+
+- name: Tune MTV | Read the backup for run {{ mtv_run_id }}
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    namespace: "{{ mtv_evidence_namespace }}"
+    name: "mtv-tuning-backup-{{ mtv_run_id }}"
+  register: _backup

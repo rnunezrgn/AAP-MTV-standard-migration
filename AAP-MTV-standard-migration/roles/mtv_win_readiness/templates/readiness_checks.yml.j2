@@ -1,0 +1,71 @@
+{% set srv = s.os.product_type != 1 %}
+{% set encrypted = s.bitlocker | rejectattr('status', 'equalto', 'FullyDecrypted') | list %}
+{% set escrow_ok = (bitlocker_escrow_method == 'none' and bitlocker_escrow_confirmed | bool)
+                   or (escrow | length > 0 and escrow | rejectattr('escrowed') | list | length == 0) %}
+{% set pin = s.bitlocker | map(attribute='protectors') | flatten | select('match', '^Tpm(Pin|StartupKey|PinStartupKey)$') | list %}
+{% set staged = virtio.drivers | default([]) | selectattr('staged') | map(attribute='driver') | list %}
+{% set missing = virtio.drivers | default([]) | rejectattr('staged') | map(attribute='driver') | list %}
+- id: os_supported
+  title: Windows version supported
+  status: {{ 'fail' if (srv and s.os.build < 14393) or ((not srv) and s.os.build < 19041) else 'pass' }}
+  detail: {{ (s.os.caption ~ ' build ' ~ s.os.build) | to_json }}
+- id: free_space
+  title: Free space on the system drive
+  status: {{ 'pass' if s.free_gb_system | float >= win_min_free_gb | float else 'fail' }}
+  detail: {{ (s.free_gb_system ~ ' GB free, need ' ~ win_min_free_gb ~ ' GB') | to_json }}
+- id: pending_reboot
+  title: No pending reboot
+  status: {{ 'warn' if s.pending_reboot else 'pass' }}
+  detail: {{ ('reboot pending: reboot before cutover' if s.pending_reboot else 'none') | to_json }}
+- id: secure_boot
+  title: Firmware and Secure Boot recorded
+  status: info
+  detail: {{ (s.firmware ~ ', Secure Boot ' ~ ('on' if s.secure_boot else 'off')) | to_json }}
+- id: tpm
+  title: TPM recorded
+  status: info
+  detail: {{ ('present=' ~ s.tpm.present ~ ', ready=' ~ s.tpm.ready ~ '. TPM state does not move: a new persistent vTPM is added after migration') | to_json }}
+- id: bitlocker_escrow
+  title: BitLocker recovery passwords escrowed
+{% if not encrypted %}
+  status: pass
+  detail: "no encrypted volumes"
+{% else %}
+  status: {{ 'pass' if escrow_ok else 'fail' }}
+  detail: {{ ((encrypted | map(attribute='mount') | join(', ')) ~ ' encrypted; escrow method ' ~ bitlocker_escrow_method
+             ~ ('' if escrow_ok else ': escrow failed or not confirmed')) | to_json }}
+{% endif %}
+- id: bitlocker_protectors
+  title: BitLocker protectors can be re-sealed automatically
+  status: {{ 'warn' if pin else 'pass' }}
+  detail: {{ (('TPM+PIN or startup key in use: a person must re-create it after migration') if pin else 'TPM or recovery password only') | to_json }}
+- id: virtio_staged
+  title: Latest VirtIO drivers staged in the driver store
+{% if not (win_stage_virtio | bool) or not virtio_win_iso_url %}
+  status: warn
+  detail: "staging disabled or no virtio_win_iso_url: only the virt-v2v bundled drivers will be used"
+{% else %}
+  status: {{ 'fail' if missing | select('in', ['viostor', 'vioscsi', 'NetKVM']) | list else ('warn' if missing else 'pass') }}
+  detail: {{ ('staged ' ~ (staged | join(', ')) ~ ' for ' ~ virtio.os_dir | default('?')
+             ~ ((', missing ' ~ (missing | join(', '))) if missing else '')) | to_json }}
+{% endif %}
+- id: vmware_inventory
+  title: VMware components inventoried
+  status: info
+  detail: {{ (rem.found.products | length ~ ' product(s), ' ~ rem.found.services | length ~ ' service(s), '
+             ~ rem.found.driver_packages | length ~ ' driver package(s): removed after migration') | to_json }}
+- id: network
+  title: Network configuration recorded
+  status: {{ 'warn' if s.network | selectattr('dhcp', 'equalto', 'Enabled') | list else 'info' }}
+  detail: {{ (s.network | map(attribute='alias') | zip(s.network | map(attribute='ipv4') | map('join', ','))
+             | map('join', '=') | join('; ')
+             ~ ('; DHCP in use: address may change unless the MAC is preserved' if s.network | selectattr('dhcp', 'equalto', 'Enabled') | list else '')) | to_json }}
+- id: domain
+  title: Domain secure channel
+{% if s.domain.joined %}
+  status: {{ 'pass' if s.domain.secure_channel else 'warn' }}
+  detail: {{ (s.domain.name ~ ': secure channel ' ~ ('ok' if s.domain.secure_channel else 'broken')) | to_json }}
+{% else %}
+  status: info
+  detail: "workgroup"
+{% endif %}

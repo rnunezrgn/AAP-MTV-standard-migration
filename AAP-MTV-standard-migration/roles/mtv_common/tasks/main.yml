@@ -1,0 +1,16 @@
+---
+- name: Common | Resolve the run id and the VM list
+  ansible.builtin.set_fact:
+    mtv_run_id: >-
+      {{ (run_id | default(awx_workflow_job_id | default(tower_workflow_job_id
+          | default(awx_job_id | default('manual'))))) | string }}
+    mtv_vms: >-
+      {{ ((migration_vms if migration_vms is not string
+          else (migration_vms | regex_replace('[,;\s]+', ' ') | trim | split(' ')))
+         | map('trim') | reject('equalto', '') | unique | list) }}
+  run_once: true
+
+- name: Common | Show the run
+  ansible.builtin.debug:
+    msg: "Run {{ mtv_run_id }}: {{ mtv_vms | length }} VM(s) requested"
+  run_once: true

@@ -1,0 +1,104 @@
+---
+# ---------------------------------------------------------------------------
+# Inputs from the workflow survey (override per launch)
+# ---------------------------------------------------------------------------
+# Newline, comma or space separated VM names exactly as they appear in vCenter.
+migration_vms: []
+# auto | warm | cold. auto picks warm for big VMs with CBT on, cold otherwise.
+migration_mode: auto
+# AAP sets awx_workflow_job_id for workflow jobs, so every stage shares one run.
+# Pass run_id explicitly when you run a single playbook outside the workflow.
+# run_id: "1234"
+
+# ---------------------------------------------------------------------------
+# vCenter (AAP "VMware vCenter" credential injects VMWARE_HOST/USER/PASSWORD)
+# ---------------------------------------------------------------------------
+vcenter_datacenter: Datacenter
+vcenter_validate_certs: false
+
+# ---------------------------------------------------------------------------
+# OpenShift / MTV (AAP "OpenShift or Kubernetes API Bearer Token" credential
+# injects K8S_AUTH_HOST / K8S_AUTH_API_KEY / K8S_AUTH_VERIFY_SSL)
+# ---------------------------------------------------------------------------
+mtv_namespace: openshift-mtv
+mtv_source_provider: vsphere
+mtv_source_provider_namespace: "{{ mtv_namespace }}"
+mtv_destination_provider: host
+mtv_destination_provider_namespace: "{{ mtv_namespace }}"
+mtv_target_namespace: migrated-vms
+mtv_target_storage_class: ocs-storagecluster-ceph-rbd-virtualization
+mtv_preserve_static_ips: true
+mtv_target_power_state: "on"
+# Optional Secret in mtv_namespace with LUKS passphrases for Linux guests.
+mtv_luks_secret: ""
+
+# Map every source network to a destination. Unmapped networks block the VM.
+#   - source: "VM Network"      # port group name, or dvportgroup:<key>
+#     type: multus              # multus | pod
+#     name: vlan20              # NetworkAttachmentDefinition (multus only)
+#     namespace: migrated-vms
+network_mappings: []
+
+# Decision thresholds
+warm_min_disk_gb: 100
+large_disk_gb: 1024
+max_vms_per_plan: 10
+warm_cold_fallback: true
+
+# Temporary MTV tuning, saved before and restored after the run
+mtv_tuning:
+  controller_max_vm_inflight: 30
+  controller_precopy_interval: 120
+
+# Waits
+mtv_plan_ready_retries: 60          # x 10 s
+mtv_migration_wait_retries: 720     # x mtv_migration_wait_delay
+mtv_migration_wait_delay: 30
+cold_graceful_shutdown: true
+cold_shutdown_timeout: 600          # seconds
+guest_connect_timeout: 120
+target_agent_retries: 90            # x 10 s
+
+# ---------------------------------------------------------------------------
+# Evidence and reporting
+# ---------------------------------------------------------------------------
+mtv_evidence_namespace: mtv-evidence
+report_local_dir: ""                # e.g. /runner/artifacts to keep a copy
+
+# ---------------------------------------------------------------------------
+# Windows guests
+# ---------------------------------------------------------------------------
+virtio_win_iso_url: ""              # internal URL of the current Red Hat virtio-win ISO
+virtio_win_iso_checksum: ""         # e.g. sha256:...
+win_stage_virtio: true
+win_virtio_drivers: [viostor, vioscsi, NetKVM, Balloon, vioserial, viorng]
+win_min_free_gb: 2
+bitlocker_escrow_method: ad         # ad | aad | none
+bitlocker_escrow_confirmed: false   # required when method is none
+bitlocker_rotate_recovery_password: true
+win_remnant_exclude: ""             # regex of VMware products to keep, e.g. 'Horizon'
+win_stop_services_before_cutover: []
+win_temp_dir: 'C:\Windows\Temp'
+
+# ---------------------------------------------------------------------------
+# Linux guests
+# ---------------------------------------------------------------------------
+linux_bind_nm_to_mac: true
+linux_install_qemu_guest_agent: true
+linux_stop_services_before_cutover: []
+linux_rebind_clevis: false          # needs luks_passphrase from a credential
+linux_clevis_tpm2_config: '{"pcr_ids":"7"}'
+
+# ---------------------------------------------------------------------------
+# OpenShift Virtualization target hardening after migration
+# ---------------------------------------------------------------------------
+target_enable_secure_boot: true     # only where the source had Secure Boot on
+target_add_vtpm_windows: true
+target_add_vtpm_linux: auto         # auto: source had a vTPM or LUKS uses TPM2
+target_persistent_efi: true
+
+# Per host: the vCenter VM name when it differs from the inventory hostname
+mtv_vm: "{{ mtv_vm_name | default(inventory_hostname) }}"
+
+# Where the Windows helper scripts live in the project
+mtv_scripts_dir: "{{ playbook_dir }}/../files/windows"

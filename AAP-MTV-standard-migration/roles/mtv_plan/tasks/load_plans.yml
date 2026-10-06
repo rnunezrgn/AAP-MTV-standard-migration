@@ -1,0 +1,17 @@
+---
+- name: Plans | Read the Plans for run {{ mtv_run_id }}
+  kubernetes.core.k8s_info:
+    api_version: forklift.konveyor.io/v1beta1
+    kind: Plan
+    namespace: "{{ mtv_namespace }}"
+    label_selectors:
+      - "mtv.demo/run-id={{ mtv_run_id }}"
+  register: _run_plans
+  delegate_to: localhost
+  run_once: true
+
+- name: Plans | Index planned VMs
+  ansible.builtin.set_fact:
+    mtv_planned: "{{ _run_plans.resources | mtv_planned_vms }}"
+    mtv_planned_vms: "{{ _run_plans.resources | mtv_planned_vms | map(attribute='vm') | list }}"
+  run_once: true

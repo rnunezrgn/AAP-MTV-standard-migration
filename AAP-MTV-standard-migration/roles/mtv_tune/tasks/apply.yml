@@ -1,0 +1,49 @@
+---
+- name: Tune MTV | Locate controller and backup
+  ansible.builtin.include_tasks: find.yml
+
+- name: Tune MTV | Save the current values (first apply only, so a re-run never overwrites the originals)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "mtv-tuning-backup-{{ mtv_run_id }}"
+        namespace: "{{ mtv_evidence_namespace }}"
+        labels:
+          app.kubernetes.io/part-of: aap-mtv-migration
+          mtv.demo/run-id: "{{ mtv_run_id }}"
+      data:
+        controller: "{{ _fc.resources[0].metadata.name }}"
+        original.json: "{{ _fc.resources[0].spec | mtv_pick(mtv_tuning.keys() | list) | to_json }}"
+  when: _backup.resources | length == 0
+
+- name: Tune MTV | Apply the temporary values
+  kubernetes.core.k8s:
+    state: patched
+    api_version: forklift.konveyor.io/v1beta1
+    kind: ForkliftController
+    name: "{{ _fc.resources[0].metadata.name }}"
+    namespace: "{{ mtv_namespace }}"
+    merge_type: merge
+    definition:
+      spec: "{{ mtv_tuning }}"
+
+- name: Tune MTV | Record evidence
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    ev_stage: tune
+    ev_vm: platform
+    ev_checks:
+      - id: backup
+        title: Original MTV values saved
+        status: pass
+        detail: "{{ (_backup.resources[0].data['original.json'] if _backup.resources | length
+                     else (_fc.resources[0].spec | mtv_pick(mtv_tuning.keys() | list) | to_json)) }}"
+      - id: applied
+        title: Temporary MTV values applied
+        status: pass
+        detail: "{{ mtv_tuning | to_json }}"

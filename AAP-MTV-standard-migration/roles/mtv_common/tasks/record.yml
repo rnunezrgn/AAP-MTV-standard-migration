@@ -1,0 +1,44 @@
+---
+# Writes one evidence record as a ConfigMap. One object per run, stage and VM,
+# so parallel hosts never write to the same object.
+# Inputs: ev_stage, ev_vm ('platform' for cluster-level stages), ev_checks
+#         (list of {id, title, status: pass|info|warn|fail, detail}), ev_facts.
+- name: "Evidence | {{ ev_stage }} | {{ ev_vm }}"
+  kubernetes.core.k8s:
+    state: present
+    force: true
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "mtv-ev-{{ mtv_run_id }}-{{ ev_stage }}-{{ ev_vm | mtv_dns(50) }}"
+        namespace: "{{ mtv_evidence_namespace }}"
+        labels:
+          app.kubernetes.io/part-of: aap-mtv-migration
+          mtv.demo/run-id: "{{ mtv_run_id }}"
+          mtv.demo/stage: "{{ ev_stage }}"
+          mtv.demo/vm: "{{ ev_vm | mtv_dns(63) }}"
+          mtv.demo/result: "{{ _result }}"
+        annotations:
+          mtv.demo/vm-name: "{{ ev_vm }}"
+          mtv.demo/job-id: "{{ awx_job_id | default('local') | string }}"
+      data:
+        evidence.json: "{{ _record | to_json }}"
+  vars:
+    _result: "{{ ev_checks | mtv_result }}"
+    _record:
+      run_id: "{{ mtv_run_id }}"
+      vm: "{{ ev_vm }}"
+      stage: "{{ ev_stage }}"
+      result: "{{ _result }}"
+      recorded: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+      job_id: "{{ awx_job_id | default('local') | string }}"
+      checks: "{{ ev_checks }}"
+      facts: "{{ ev_facts | default({}) }}"
+  delegate_to: localhost
+  become: false
+
+- name: "Evidence | {{ ev_stage }} | {{ ev_vm }} | summary"
+  ansible.builtin.debug:
+    msg: "{{ [ev_stage ~ ' | ' ~ ev_vm ~ ' => ' ~ (ev_checks | mtv_result) | upper]
+             + (ev_checks | map('mtv_fmt_check') | list) }}"

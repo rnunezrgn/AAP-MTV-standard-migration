@@ -1,0 +1,13 @@
+---
+# Workflow node 08: warm cutover now / cold migration start, then wait.
+# Fails when any VM did not migrate, so the workflow takes the rollback path.
+- name: "08 | Execute cutover"
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Cutover and wait
+      ansible.builtin.include_role:
+        name: mtv_plan
+        tasks_from: cutover

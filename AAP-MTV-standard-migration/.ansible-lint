@@ -1,0 +1,11 @@
+---
+profile: production
+offline: true
+exclude_paths:
+  - aap/controller_config.yml
+  - collections/
+skip_list:
+  - var-naming[no-role-prefix]   # shared variables are defined once in mtv_common
+  - meta-runtime
+  - galaxy
+  - name[template]               # VM names in task titles make the job log readable

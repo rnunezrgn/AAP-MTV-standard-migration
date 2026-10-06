@@ -1,0 +1,12 @@
+---
+# Workflow node 05: save current MTV values, then apply the temporary ones.
+- name: "05 | Tune MTV for this run"
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Apply tuning
+      ansible.builtin.include_role:
+        name: mtv_tune
+        tasks_from: apply

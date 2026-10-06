@@ -1,0 +1,114 @@
+---
+# Node 90, play 1 (localhost). Leaves every VM that did not finish migrating
+# running on VMware again, with nothing competing for its IP on OpenShift.
+- name: Rollback | Load plans
+  ansible.builtin.include_role:
+    name: mtv_plan
+    tasks_from: load_plans
+
+- name: Rollback | Read each Plan's per-VM status
+  kubernetes.core.k8s_info:
+    api_version: forklift.konveyor.io/v1beta1
+    kind: Plan
+    namespace: "{{ mtv_namespace }}"
+    label_selectors:
+      - "mtv.demo/run-id={{ mtv_run_id }}"
+  register: _plans_now
+
+- name: Rollback | Work out which VMs need rolling back
+  ansible.builtin.set_fact:
+    mtv_rollback: >-
+      {{ mtv_planned | rejectattr('vm', 'in',
+           _plans_now.resources | mtv_plan_vm_outcomes | selectattr('ok') | map(attribute='vm') | list) | list }}
+
+- name: Rollback | Read the Migrations
+  kubernetes.core.k8s_info:
+    api_version: forklift.konveyor.io/v1beta1
+    kind: Migration
+    namespace: "{{ mtv_namespace }}"
+    label_selectors:
+      - "mtv.demo/run-id={{ mtv_run_id }}"
+  register: _migs
+
+- name: Rollback | Cancel unfinished VMs in running Migrations
+  kubernetes.core.k8s:
+    state: patched
+    api_version: forklift.konveyor.io/v1beta1
+    kind: Migration
+    namespace: "{{ mtv_namespace }}"
+    name: "{{ item.metadata.name }}"
+    merge_type: merge
+    definition:
+      spec:
+        cancel: >-
+          {{ mtv_rollback | selectattr('plan', 'equalto', item.spec.plan.name)
+             | map('mtv_ref') | list }}
+  loop: "{{ _migs.resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when:
+    - mtv_rollback | selectattr('plan', 'equalto', item.spec.plan.name) | list | length > 0
+    - item.status.completed is not defined
+
+- name: Rollback | Find target VMs that may hold the same IPs
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    namespace: "{{ mtv_target_namespace }}"
+    label_selectors:
+      - "vmID={{ item.moid }}"
+  loop: "{{ mtv_rollback }}"
+  loop_control:
+    label: "{{ item.vm }}"
+  register: _targets
+
+- name: Rollback | Halt those target VMs
+  kubernetes.core.k8s:
+    state: patched
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ item.metadata.namespace }}"
+    merge_type: merge
+    definition:
+      spec:
+        running: null
+        runStrategy: Halted
+  loop: "{{ _targets.results | map(attribute='resources') | flatten }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: Rollback | Power the source VMs back on in vCenter
+  vmware.vmware.vm_powerstate:
+    datacenter: "{{ vcenter_datacenter }}"
+    moid: "{{ item.moid }}"
+    state: powered-on
+    validate_certs: "{{ vcenter_validate_certs }}"
+  loop: "{{ mtv_rollback }}"
+  loop_control:
+    label: "{{ item.vm }}"
+  register: _poweron
+  failed_when: false
+
+- name: Rollback | Record evidence
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    _p: "{{ _poweron.results | selectattr('item.vm', 'equalto', _rb.vm) | first }}"
+    _t: "{{ _targets.results | selectattr('item.vm', 'equalto', _rb.vm) | map(attribute='resources') | flatten }}"
+    ev_stage: rollback
+    ev_vm: "{{ _rb.vm }}"
+    ev_checks:
+      - id: target_halted
+        title: Target VM halted on OpenShift
+        status: "{{ 'pass' if _t else 'info' }}"
+        detail: "{{ (_t | map(attribute='metadata.name') | join(', ') ~ ' halted') if _t else 'no target VM' }}"
+      - id: source_on
+        title: Source VM powered on in vCenter
+        status: "{{ 'fail' if _p is failed or _p.failed | default(false) else 'pass' }}"
+        detail: "{{ _p.msg | default('powered on') }}"
+  loop: "{{ mtv_rollback }}"
+  loop_control:
+    loop_var: _rb
+    label: "{{ _rb.vm }}"

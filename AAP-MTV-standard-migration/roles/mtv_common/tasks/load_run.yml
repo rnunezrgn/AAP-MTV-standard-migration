@@ -1,0 +1,33 @@
+---
+# Loads the decision table written by Decide. Each stage reads it back from
+# OpenShift, so any stage can be re-run on its own with the same run_id.
+- name: Common | Read the decision table for run {{ mtv_run_id }}
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    namespace: "{{ mtv_evidence_namespace }}"
+    name: "mtv-run-{{ mtv_run_id }}-decisions"
+  register: _mtv_decisions_cm
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Common | Fail when Decide has not run for this run id
+  ansible.builtin.assert:
+    that: _mtv_decisions_cm.resources | length == 1
+    fail_msg: >-
+      No decision table for run {{ mtv_run_id }} in {{ mtv_evidence_namespace }}.
+      Run Discover and Decide first, or pass run_id.
+    quiet: true
+  run_once: true
+
+- name: Common | Load decisions and lookup tables
+  ansible.builtin.set_fact:
+    mtv_decisions: "{{ _decisions }}"
+    mtv_plans: "{{ _mtv_decisions_cm.resources[0].data['plans.json'] | from_json }}"
+    mtv_decision_map: "{{ dict(_decisions | map(attribute='vm') | zip(_decisions)) }}"
+    mtv_eligible_windows: "{{ _decisions | selectattr('eligible') | selectattr('os', 'equalto', 'windows') | map(attribute='vm') | list }}"
+    mtv_eligible_linux: "{{ _decisions | selectattr('eligible') | selectattr('os', 'equalto', 'linux') | map(attribute='vm') | list }}"
+  vars:
+    _decisions: "{{ _mtv_decisions_cm.resources[0].data['decisions.json'] | from_json }}"
+  run_once: true

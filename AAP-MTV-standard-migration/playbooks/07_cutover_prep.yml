@@ -1,0 +1,50 @@
+---
+# Workflow node 07: runs after the cutover approval, right before cutover.
+- name: "07 | Cutover prep | Load plans"
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Load decisions
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: load_run
+
+    - name: Load plans
+      ansible.builtin.include_role:
+        name: mtv_plan
+        tasks_from: load_plans
+
+- name: "07 | Cutover prep | Windows guests"
+  hosts: windows_guests
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Only planned Windows VMs
+      ansible.builtin.meta: end_host
+      when: >-
+        mtv_vm not in hostvars['localhost'].mtv_planned_vms | default([])
+        or mtv_vm not in hostvars['localhost'].mtv_eligible_windows | default([])
+
+    - name: Windows cutover prep
+      ansible.builtin.include_role:
+        name: mtv_win_cutover
+
+- name: "07 | Cutover prep | Linux guests"
+  hosts: linux_guests
+  gather_facts: false
+  become: true
+  roles:
+    - mtv_common
+  tasks:
+    - name: Only planned Linux VMs
+      ansible.builtin.meta: end_host
+      when: >-
+        mtv_vm not in hostvars['localhost'].mtv_planned_vms | default([])
+        or mtv_vm not in hostvars['localhost'].mtv_eligible_linux | default([])
+
+    - name: Linux cutover prep
+      ansible.builtin.include_role:
+        name: mtv_linux_cutover

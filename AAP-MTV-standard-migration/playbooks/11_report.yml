@@ -1,0 +1,18 @@
+---
+# Workflow node 11: final evidence report (HTML + JSON in a ConfigMap).
+- name: "11 | Final evidence report"
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Load decisions
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: load_run
+
+    - name: Report
+      ansible.builtin.include_role:
+        name: mtv_report
+      vars:
+        report_phase: final

@@ -1,0 +1,116 @@
+---
+# Order: agent up -> VirtIO proof -> remove remnants -> reboot -> vTPM +
+# BitLocker re-seal -> evidence. The vTPM was added by mtv_target before this.
+- name: Windows post-check | Reachability on OpenShift Virtualization
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: reach
+  vars:
+    reach_stage: postcheck
+
+- name: Windows post-check | Load the pre-migration state
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: load_evidence
+  vars:
+    ev_stage: readiness
+    ev_vm: "{{ mtv_vm }}"
+
+- name: Windows post-check | Keep the pre-migration facts
+  ansible.builtin.set_fact:
+    _pre: "{{ mtv_evidence.facts | default({}) }}"
+
+- name: Windows post-check | Prove the VirtIO drivers bound to the new hardware
+  ansible.windows.win_powershell:
+    script: "{{ lookup('ansible.builtin.file', mtv_scripts_dir ~ '/Test-VirtioDrivers.ps1') }}"
+    parameters:
+      BaselineJson: "{{ _pre.virtio.baseline | default({}) | to_json }}"
+  register: _virtio
+
+- name: Windows post-check | Update VirtIO drivers older than the staged baseline
+  when: not _virtio.result.all_ok and virtio_win_iso_url | length > 0
+  block:
+    - name: Windows post-check | Download the virtio-win ISO
+      ansible.windows.win_get_url:
+        url: "{{ virtio_win_iso_url }}"
+        dest: '{{ win_temp_dir }}\virtio-win.iso'
+        checksum: "{{ virtio_win_iso_checksum.split(':')[1] if virtio_win_iso_checksum else omit }}"
+        checksum_algorithm: "{{ virtio_win_iso_checksum.split(':')[0] if virtio_win_iso_checksum else omit }}"
+
+    - name: Windows post-check | Install newer drivers and re-check
+      ansible.windows.win_powershell:
+        script: "{{ lookup('ansible.builtin.file', mtv_scripts_dir ~ '/Test-VirtioDrivers.ps1') }}"
+        parameters:
+          BaselineJson: "{{ _pre.virtio.baseline | default({}) | to_json }}"
+          IsoPath: '{{ win_temp_dir }}\virtio-win.iso'
+          OsDir: "{{ _pre.virtio.os_dir | default('') }}"
+      register: _virtio
+  always:
+    - name: Windows post-check | Remove the ISO
+      ansible.windows.win_file:
+        path: '{{ win_temp_dir }}\virtio-win.iso'
+        state: absent
+
+- name: Windows post-check | Remove VMware remnants
+  ansible.windows.win_powershell:
+    script: "{{ lookup('ansible.builtin.file', mtv_scripts_dir ~ '/Invoke-VMwareRemnants.ps1') }}"
+    parameters:
+      Mode: Remove
+      Exclude: "{{ win_remnant_exclude }}"
+  register: _remove
+
+- name: Windows post-check | Reboot after cleanup
+  ansible.windows.win_reboot:
+    reboot_timeout: 900
+  when: _remove.result.reboot_required | bool
+
+- name: Windows post-check | Re-inventory VMware remnants after the reboot
+  ansible.windows.win_powershell:
+    script: "{{ lookup('ansible.builtin.file', mtv_scripts_dir ~ '/Invoke-VMwareRemnants.ps1') }}"
+    parameters:
+      Mode: Inventory
+      Exclude: "{{ win_remnant_exclude }}"
+  register: _remnants_after
+  changed_when: false
+
+- name: Windows post-check | Re-seal BitLocker to the new vTPM and resume protection
+  ansible.windows.win_powershell:
+    script: "{{ lookup('ansible.builtin.file', mtv_scripts_dir ~ '/Invoke-BitLockerReseal.ps1') }}"
+    parameters:
+      Method: "{{ bitlocker_escrow_method }}"
+      Rotate: "{{ bitlocker_rotate_recovery_password | bool }}"
+  register: _reseal
+  when: _pre.state.bitlocker | default([]) | rejectattr('status', 'equalto', 'FullyDecrypted') | list | length > 0
+
+- name: Windows post-check | Collect the post-migration state
+  ansible.windows.win_powershell:
+    script: "{{ lookup('ansible.builtin.file', mtv_scripts_dir ~ '/Get-MigrationState.ps1') }}"
+  register: _post
+  changed_when: false
+
+- name: Windows post-check | Compare before and after
+  ansible.builtin.set_fact:
+    _checks: "{{ lookup('ansible.builtin.template', 'postcheck_checks.yml.j2') | from_yaml }}"
+  vars:
+    pre: "{{ _pre.state | default({}) }}"
+    post: "{{ _post.result }}"
+    virtio: "{{ _virtio.result }}"
+    removed: "{{ _remove.result }}"
+    after: "{{ _remnants_after.result.remaining }}"
+    reseal: "{{ _reseal.result | default({}) }}"
+
+- name: Windows post-check | Record evidence
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    ev_stage: postcheck
+    ev_vm: "{{ mtv_vm }}"
+    ev_checks: "{{ _checks }}"
+    ev_facts:
+      state: "{{ _post.result }}"
+      virtio: "{{ _virtio.result }}"
+      removed: "{{ _remove.result.removed }}"
+      remnant_errors: "{{ _remove.result.errors }}"
+      remnant_manual: "{{ _remove.result.manual }}"
+      reseal_log: "{{ _reseal.result.log | default([]) }}"

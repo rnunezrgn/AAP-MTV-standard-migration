@@ -1,0 +1,61 @@
+{% set major = ansible_facts.distribution_major_version | int %}
+{% set is_rhel = ansible_facts.distribution in ['RedHat', 'CentOS', 'Rocky', 'AlmaLinux', 'OracleLinux'] %}
+{% set missing = _virtio_missing.stdout_lines %}
+{% set ifname_bound = _profiles | selectattr('ifname') | rejectattr('mac') | list %}
+- id: os_supported
+  title: Linux version supported
+  status: {{ 'pass' if (is_rhel and major >= 8) else ('warn' if is_rhel and major == 7 else ('warn' if not is_rhel else 'fail')) }}
+  detail: {{ (ansible_facts.distribution ~ ' ' ~ ansible_facts.distribution_version ~ ', kernel ' ~ ansible_facts.kernel) | to_json }}
+- id: virtio_drivers
+  title: VirtIO drivers present for the running kernel
+  status: {{ 'fail' if missing | select('in', ['virtio_blk', 'virtio_scsi']) | list | length == 2 or 'virtio_net' in missing else ('warn' if missing else 'pass') }}
+  detail: {{ ('missing: ' ~ (missing | join(', ')) if missing else 'virtio_blk, virtio_scsi, virtio_net, virtio_pci available: virt-v2v rebuilds the initramfs') | to_json }}
+- id: fstab_device_names
+  title: fstab does not use /dev/sdX names
+  status: {{ 'warn' if _fstab_sd else 'pass' }}
+  detail: {{ (('uses ' ~ (_fstab_sd | join(', ')) ~ ': virt-v2v rewrites these, but UUID= or LABEL= is safer') if _fstab_sd else 'UUID, LABEL or LVM paths only') | to_json }}
+- id: sd_references
+  title: No sdX paths in LVM filters or the kernel command line
+  status: {{ 'warn' if _sd_refs.stdout_lines else 'pass' }}
+  detail: {{ (_sd_refs.stdout_lines | join('; ') or 'none') | to_json }}
+- id: nic_naming
+  title: Network profiles survive the NIC rename
+{% if _nm.stdout_lines == ['NO_NM'] %}
+  status: warn
+  detail: "NetworkManager not in use: check ifcfg files by hand"
+{% else %}
+  status: {{ ('warn' if ifname_bound and not linux_bind_nm_to_mac | bool else 'pass') }}
+  detail: {{ ((ifname_bound | map(attribute='name') | join(', ') ~ ' bound to ' ~ (ifname_bound | map(attribute='ifname') | join(', '))
+             ~ (': cutover prep re-binds them to the MAC' if linux_bind_nm_to_mac | bool else ': will not come up after the rename'))
+             if ifname_bound else 'profiles match by MAC or are unbound') | to_json }}
+{% endif %}
+- id: open_vm_tools
+  title: VMware tooling inventoried
+  status: info
+  detail: {{ ('open-vm-tools installed: removed after migration' if 'open-vm-tools' in ansible_facts.packages else 'open-vm-tools not installed') | to_json }}
+- id: guest_agent
+  title: qemu-guest-agent installed or installable
+  status: {{ 'pass' if _qga.rc == 0 else 'warn' }}
+  detail: {{ ('available' if _qga.rc == 0 else 'not found in enabled repos: check RHSM or Satellite content') | to_json }}
+- id: secure_boot
+  title: Secure Boot state recorded
+  status: info
+  detail: {{ (_sb.stdout | default('mokutil not available') | trim or 'unknown') | to_json }}
+- id: luks
+  title: Encrypted volumes
+{% if _luks_devs %}
+  status: {{ 'warn' if (_clevis_tpm2 and not linux_rebind_clevis | bool) or not mtv_luks_secret else 'pass' }}
+  detail: {{ ((_luks_devs | join(', ')) ~ (': MTV needs the passphrase Secret (mtv_luks_secret)' if not mtv_luks_secret else '')
+             ~ ('; Clevis TPM2 binding must be re-bound to the new vTPM' if _clevis_tpm2 else '')) | to_json }}
+{% else %}
+  status: pass
+  detail: "no LUKS volumes"
+{% endif %}
+- id: selinux
+  title: SELinux mode recorded
+  status: info
+  detail: {{ (ansible_facts.selinux.status | default('disabled') ~ ' / ' ~ ansible_facts.selinux.mode | default('-')) | to_json }}
+- id: network
+  title: Network configuration recorded
+  status: info
+  detail: {{ ((ansible_facts.all_ipv4_addresses | default([]) | join(', ')) ~ ' via ' ~ (ansible_facts.default_ipv4.gateway | default('no default route'))) | to_json }}

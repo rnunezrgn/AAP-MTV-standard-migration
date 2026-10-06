@@ -1,0 +1,21 @@
+apiVersion: forklift.konveyor.io/v1beta1
+kind: NetworkMap
+metadata:
+  name: mtv-{{ mtv_run_id }}-network
+  namespace: {{ mtv_namespace }}
+  labels:
+    app.kubernetes.io/part-of: aap-mtv-migration
+    mtv.demo/run-id: "{{ mtv_run_id }}"
+spec:
+  provider:
+    source: { name: {{ mtv_source_provider }}, namespace: {{ mtv_source_provider_namespace }} }
+    destination: { name: {{ mtv_destination_provider }}, namespace: {{ mtv_destination_provider_namespace }} }
+  map:
+{% for m in network_mappings if m.source in _networks %}
+    - source: { name: {{ m.source | to_json }} }
+{% if m.type == 'pod' %}
+      destination: { type: pod }
+{% else %}
+      destination: { type: multus, name: {{ m.name }}, namespace: {{ m.namespace | default(mtv_target_namespace) }} }
+{% endif %}
+{% endfor %}

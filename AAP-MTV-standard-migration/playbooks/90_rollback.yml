@@ -1,0 +1,26 @@
+---
+# Workflow node 90: cutover denied, timed out or failed.
+- name: "90 | Rollback | Controller side"
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Roll back
+      ansible.builtin.include_role:
+        name: mtv_rollback
+
+- name: "90 | Rollback | Windows guests back on VMware"
+  hosts: windows_guests
+  gather_facts: false
+  roles:
+    - mtv_common
+  tasks:
+    - name: Only rolled-back VMs
+      ansible.builtin.meta: end_host
+      when: mtv_vm not in hostvars['localhost'].mtv_rollback | default([]) | map(attribute='vm') | list
+
+    - name: Resume BitLocker
+      ansible.builtin.include_role:
+        name: mtv_rollback
+        tasks_from: windows

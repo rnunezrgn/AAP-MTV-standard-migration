@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Migration {{ 'pre-check' if _model.phase == 'pre' else 'evidence' }} report, run {{ _model.run_id }}</title>
+<style>
+  :root { --ink:#151515; --muted:#6a6e73; --line:#d2d2d2; --card:#f2f2f2; --pass:#3e8635; --warn:#b8860b; --fail:#c9190b; }
+  * { box-sizing:border-box; }
+  body { font-family: Arial, Helvetica, sans-serif; color:var(--ink); margin:0; padding:32px; background:#fff; }
+  h1 { font-size:26px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 24px; }
+  .cards { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:28px; }
+  .card { background:var(--card); border-radius:8px; padding:14px 20px; min-width:130px; }
+  .card b { display:block; font-size:28px; }
+  .card span { color:var(--muted); font-size:13px; }
+  table { border-collapse:collapse; width:100%; margin-bottom:28px; font-size:14px; }
+  th, td { border:1px solid var(--line); padding:7px 10px; text-align:left; vertical-align:top; }
+  th { background:var(--ink); color:#fff; font-weight:600; }
+  .b { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; font-weight:700; color:#fff; }
+  .pass,.info,.skip { background:var(--pass); } .warn { background:var(--warn); } .fail { background:var(--fail); }
+  .none { background:#b8bbbe; }
+  details { border:1px solid var(--line); border-radius:8px; margin-bottom:12px; padding:10px 14px; }
+  summary { cursor:pointer; font-weight:700; }
+  h3 { font-size:15px; margin:16px 0 6px; }
+  .wrap { overflow-x:auto; }
+  .muted { color:var(--muted); }
+</style>
+</head>
+<body>
+<h1>{{ 'Pre-check report' if _model.phase == 'pre' else 'Migration evidence report' }}</h1>
+<p class="sub">Run {{ _model.run_id }} · generated {{ _model.generated }} · OpenShift Virtualization standard path (no array offload)</p>
+
+<div class="cards">
+  <div class="card"><b>{{ _model.counts.total }}</b><span>VMs in scope</span></div>
+  <div class="card"><b style="color:var(--pass)">{{ _model.counts.pass }}</b><span>pass</span></div>
+  <div class="card"><b style="color:var(--warn)">{{ _model.counts.warn }}</b><span>warn</span></div>
+  <div class="card"><b style="color:var(--fail)">{{ _model.counts.fail }}</b><span>fail</span></div>
+</div>
+
+<div class="wrap">
+<table>
+  <tr><th>VM</th><th>OS</th><th>Mode</th><th>Plan</th>{% for st in _model.stages %}<th>{{ st | replace('_', ' ') }}</th>{% endfor %}<th>Overall</th></tr>
+{% for v in _model.vms %}
+  <tr>
+    <td><b>{{ v.vm | e }}</b></td><td>{{ v.os }}</td><td>{{ v.mode }}</td><td>{{ v.plan }}</td>
+{% for st in _model.stages %}
+{% set ev = v.stages.get(st) %}
+    <td>{% if ev %}<span class="b {{ ev.result }}">{{ ev.result | upper }}</span>{% else %}<span class="b none">-</span>{% endif %}</td>
+{% endfor %}
+    <td><span class="b {{ v.overall }}">{{ v.overall | upper }}</span></td>
+  </tr>
+{% endfor %}
+</table>
+</div>
+
+{% if _model.platform %}
+<h2>Platform</h2>
+<div class="wrap"><table>
+  <tr><th>Stage</th><th>Result</th><th>Checks</th></tr>
+{% for st, ev in _model.platform.items() %}
+  <tr><td>{{ st }}</td><td><span class="b {{ ev.result }}">{{ ev.result | upper }}</span></td>
+      <td>{% for c in ev.checks %}{{ c.title | e }}: {{ c.detail | e }}<br>{% endfor %}</td></tr>
+{% endfor %}
+</table></div>
+{% endif %}
+
+<h2>Details per VM</h2>
+{% for v in _model.vms %}
+<details{% if v.overall == 'fail' %} open{% endif %}>
+  <summary>{{ v.vm | e }} <span class="b {{ v.overall }}">{{ v.overall | upper }}</span></summary>
+{% for st in _model.stages if v.stages.get(st) %}
+{% set ev = v.stages[st] %}
+  <h3>{{ st | replace('_', ' ') | capitalize }} <span class="muted">· {{ ev.recorded }} · job {{ ev.job_id }}</span></h3>
+  <div class="wrap"><table>
+    <tr><th style="width:90px">Status</th><th style="width:30%">Check</th><th>Detail</th></tr>
+{% for c in ev.checks %}
+    <tr><td><span class="b {{ c.status }}">{{ c.status | upper }}</span></td><td>{{ c.title | e }}</td><td>{{ c.detail | e }}</td></tr>
+{% endfor %}
+  </table></div>
+{% endfor %}
+</details>
+{% endfor %}
+</body>
+</html>

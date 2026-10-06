@@ -1,0 +1,10 @@
+---
+# Creates every AAP object in controller_config.yml.
+#   ansible-galaxy collection install infra.aap_configuration ansible.platform ansible.controller
+#   export AAP_HOSTNAME=https://aap.example.com AAP_USERNAME=admin AAP_PASSWORD=...
+#   ansible-playbook aap/apply.yml -e @aap/controller_config.yml
+- name: Configure AAP for the MTV migration workflow
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - infra.aap_configuration.dispatch

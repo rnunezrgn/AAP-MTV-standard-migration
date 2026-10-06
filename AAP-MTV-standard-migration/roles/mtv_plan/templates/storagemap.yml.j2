@@ -1,0 +1,17 @@
+apiVersion: forklift.konveyor.io/v1beta1
+kind: StorageMap
+metadata:
+  name: mtv-{{ mtv_run_id }}-storage
+  namespace: {{ mtv_namespace }}
+  labels:
+    app.kubernetes.io/part-of: aap-mtv-migration
+    mtv.demo/run-id: "{{ mtv_run_id }}"
+spec:
+  provider:
+    source: { name: {{ mtv_source_provider }}, namespace: {{ mtv_source_provider_namespace }} }
+    destination: { name: {{ mtv_destination_provider }}, namespace: {{ mtv_destination_provider_namespace }} }
+  map:
+{% for ds in _datastores %}
+    - source: { name: {{ ds | to_json }} }
+      destination: { storageClass: {{ mtv_target_storage_class }} }
+{% endfor %}

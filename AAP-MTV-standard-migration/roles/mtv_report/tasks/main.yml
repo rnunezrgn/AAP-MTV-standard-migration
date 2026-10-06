@@ -1,0 +1,65 @@
+---
+- name: Report | Read all evidence for run {{ mtv_run_id }}
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    namespace: "{{ mtv_evidence_namespace }}"
+    label_selectors:
+      - "mtv.demo/run-id={{ mtv_run_id }}"
+      - "mtv.demo/stage"
+  register: _ev_cms
+
+- name: Report | Build the report model
+  ansible.builtin.set_fact:
+    _model: "{{ _ev_cms.resources | mtv_report_model(mtv_decisions, mtv_run_id, report_phase) }}"
+
+- name: Report | Render HTML
+  ansible.builtin.set_fact:
+    _html: "{{ lookup('ansible.builtin.template', 'report.html.j2') }}"
+
+- name: Report | Store the report in OpenShift
+  kubernetes.core.k8s:
+    state: present
+    force: true
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "mtv-report-{{ mtv_run_id }}-{{ report_phase }}"
+        namespace: "{{ mtv_evidence_namespace }}"
+        labels:
+          app.kubernetes.io/part-of: aap-mtv-migration
+          mtv.demo/run-id: "{{ mtv_run_id }}"
+          mtv.demo/report: "{{ report_phase }}"
+      data:
+        report.html: "{{ _html }}"
+        report.json: "{{ _model | to_nice_json }}"
+
+- name: Report | Keep a local copy
+  ansible.builtin.copy:
+    content: "{{ item.content }}"
+    dest: "{{ report_local_dir }}/mtv-report-{{ mtv_run_id }}-{{ report_phase }}.{{ item.ext }}"
+    mode: "0644"
+  loop:
+    - { ext: html, content: "{{ _html }}" }
+    - { ext: json, content: "{{ _model | to_nice_json }}" }
+  loop_control:
+    label: "{{ item.ext }}"
+  when: report_local_dir | length > 0
+
+- name: Report | Summary
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['Run ' ~ mtv_run_id ~ ' (' ~ report_phase ~ '): ' ~ _model.counts.pass ~ ' pass, '
+          ~ _model.counts.warn ~ ' warn, ' ~ _model.counts.fail ~ ' fail of ' ~ _model.counts.total]
+         + (_model.vms | map('mtv_report_row', _model.stages) | list) }}
+
+- name: Report | Expose the summary as workflow artifacts
+  ansible.builtin.set_stats:
+    data:
+      mtv_report:
+        phase: "{{ report_phase }}"
+        configmap: "mtv-report-{{ mtv_run_id }}-{{ report_phase }}"
+        namespace: "{{ mtv_evidence_namespace }}"
+        counts: "{{ _model.counts }}"
+    per_host: false

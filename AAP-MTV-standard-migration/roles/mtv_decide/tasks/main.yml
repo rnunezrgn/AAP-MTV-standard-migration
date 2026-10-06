@@ -1,0 +1,82 @@
+---
+- name: Decide | Read the discovery for run {{ mtv_run_id }}
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    namespace: "{{ mtv_evidence_namespace }}"
+    name: "mtv-run-{{ mtv_run_id }}-discovery"
+  register: _disc
+
+- name: Decide | Fail when Discover has not run
+  ansible.builtin.assert:
+    that: _disc.resources | length == 1
+    fail_msg: "No discovery for run {{ mtv_run_id }}. Run Discover first."
+    quiet: true
+
+- name: Decide | Apply the decision rules
+  ansible.builtin.set_fact:
+    _outcome: >-
+      {{ (_disc.resources[0].data['discovery.json'] | from_json)
+         | mtv_decide(mode=migration_mode,
+                      warm_min_disk_gb=warm_min_disk_gb,
+                      large_disk_gb=large_disk_gb,
+                      max_vms_per_plan=max_vms_per_plan,
+                      run_id=mtv_run_id,
+                      network_mappings=network_mappings,
+                      cold_fallback=warm_cold_fallback) }}
+
+- name: Decide | Store the decision table
+  kubernetes.core.k8s:
+    state: present
+    force: true
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "mtv-run-{{ mtv_run_id }}-decisions"
+        namespace: "{{ mtv_evidence_namespace }}"
+        labels:
+          app.kubernetes.io/part-of: aap-mtv-migration
+          mtv.demo/run-id: "{{ mtv_run_id }}"
+      data:
+        decisions.json: "{{ _outcome.decisions | to_json }}"
+        plans.json: "{{ _outcome.plans | to_json }}"
+
+- name: Decide | Record evidence per VM
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    ev_stage: decide
+    ev_vm: "{{ _d.vm }}"
+    ev_checks: "{{ _d.checks }}"
+    ev_facts:
+      os: "{{ _d.os }}"
+      mode: "{{ _d.mode }}"
+      plan: "{{ _d.plan }}"
+      reasons: "{{ _d.reasons }}"
+      blockers: "{{ _d.blockers }}"
+  loop: "{{ _outcome.decisions }}"
+  loop_control:
+    loop_var: _d
+    label: "{{ _d.vm }}"
+
+- name: Decide | Decision table (review this before approving)
+  ansible.builtin.debug:
+    msg: "{{ [_header, _rule] + _rows }}"
+  vars:
+    _fmt: "%-26s %-8s %-5s %-24s %s"
+    _header: "{{ _fmt | format('VM', 'OS', 'MODE', 'PLAN', 'REASON / BLOCKER') }}"
+    _rule: "{{ '-' * 100 }}"
+    _rows: >-
+      {{ _outcome.decisions | map('mtv_decision_row') | list }}
+
+- name: Decide | Pass the summary to later workflow nodes
+  ansible.builtin.set_stats:
+    data:
+      mtv_run_id: "{{ mtv_run_id }}"
+      mtv_decision_summary:
+        eligible: "{{ _outcome.decisions | selectattr('eligible') | map(attribute='vm') | list }}"
+        blocked: "{{ _outcome.decisions | rejectattr('eligible') | map(attribute='vm') | list }}"
+        plans: "{{ _outcome.plans | map(attribute='name') | list }}"
+    per_host: false

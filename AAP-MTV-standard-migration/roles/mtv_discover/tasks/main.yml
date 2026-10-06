@@ -1,0 +1,84 @@
+---
+- name: Discover | Fail fast when no VMs were given
+  ansible.builtin.assert:
+    that: mtv_vms | length > 0
+    fail_msg: "Set migration_vms in the survey."
+    quiet: true
+
+- name: Discover | Ensure the evidence namespace exists
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ mtv_evidence_namespace }}"
+        labels:
+          app.kubernetes.io/part-of: aap-mtv-migration
+
+- name: Discover | Read VM summaries from vCenter
+  community.vmware.vmware_guest_info:
+    datacenter: "{{ vcenter_datacenter }}"
+    name: "{{ item }}"
+    validate_certs: "{{ vcenter_validate_certs }}"
+  loop: "{{ mtv_vms }}"
+  register: _summary
+  failed_when: false
+
+- name: Discover | Read firmware, vTPM, CBT, snapshots, disks and NICs
+  community.vmware.vmware_guest_info:
+    datacenter: "{{ vcenter_datacenter }}"
+    name: "{{ item }}"
+    validate_certs: "{{ vcenter_validate_certs }}"
+    schema: vsphere
+    properties:
+      - config.guestId
+      - config.guestFullName
+      - config.firmware
+      - config.bootOptions
+      - config.changeTrackingEnabled
+      - config.hardware.device
+      - snapshot
+      - runtime.powerState
+      - guest.toolsRunningStatus
+      - guest.net
+  loop: "{{ mtv_vms }}"
+  register: _detail
+  failed_when: false
+
+- name: Discover | Normalise per-VM facts
+  ansible.builtin.set_fact:
+    mtv_discovery: "{{ mtv_discovery | default([]) + [item.0 | mtv_vm_facts(item.1, item.0.item)] }}"
+  loop: "{{ _summary.results | zip(_detail.results) | list }}"
+  loop_control:
+    label: "{{ item.0.item }}"
+
+- name: Discover | Store the discovery for Decide
+  kubernetes.core.k8s:
+    state: present
+    force: true
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "mtv-run-{{ mtv_run_id }}-discovery"
+        namespace: "{{ mtv_evidence_namespace }}"
+        labels:
+          app.kubernetes.io/part-of: aap-mtv-migration
+          mtv.demo/run-id: "{{ mtv_run_id }}"
+      data:
+        discovery.json: "{{ mtv_discovery | to_json }}"
+
+- name: Discover | Record evidence per VM
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    ev_stage: discover
+    ev_vm: "{{ _f.vm }}"
+    ev_checks: "{{ _f | mtv_discover_checks }}"
+    ev_facts: "{{ _f }}"
+  loop: "{{ mtv_discovery }}"
+  loop_control:
+    loop_var: _f
+    label: "{{ _f.vm }}"

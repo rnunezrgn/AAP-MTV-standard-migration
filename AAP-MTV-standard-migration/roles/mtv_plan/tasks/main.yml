@@ -1,0 +1,118 @@
+---
+# Node 06: create maps and plans for the VMs that passed the gate, then start
+# warm precopies. Cold plans wait for the cutover node.
+- name: Plan | Read readiness results
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    namespace: "{{ mtv_evidence_namespace }}"
+    label_selectors:
+      - "mtv.demo/run-id={{ mtv_run_id }}"
+      - "mtv.demo/stage=readiness"
+  register: _ready
+
+- name: Plan | Work out the final VM list
+  ansible.builtin.set_fact:
+    _go: >-
+      {{ mtv_decisions | selectattr('eligible') | map(attribute='vm')
+         | select('in', _ready.resources | mtv_cm_vms(['pass', 'warn'])) | list }}
+
+- name: Plan | Something must be left to migrate
+  ansible.builtin.assert:
+    that: _go | length > 0
+    fail_msg: "No VM passed readiness for run {{ mtv_run_id }}."
+    quiet: true
+
+- name: Plan | Final plan membership
+  ansible.builtin.set_fact:
+    _plans: >-
+      {{ mtv_plans | map('mtv_plan_filter', _go) | selectattr('vms') | list }}
+    _datastores: >-
+      {{ _go | map('extract', mtv_decision_map) | map(attribute='source.datastores') | flatten | unique | list }}
+    _networks: >-
+      {{ _go | map('extract', mtv_decision_map) | map(attribute='source.networks') | flatten | unique | list }}
+
+- name: Plan | Create the StorageMap and NetworkMap
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('ansible.builtin.template', item) | from_yaml }}"
+  loop: [storagemap.yml.j2, networkmap.yml.j2]
+
+- name: Plan | Create the Plans
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('ansible.builtin.template', 'plan.yml.j2') | from_yaml }}"
+  loop: "{{ _plans }}"
+  loop_control:
+    loop_var: _plan
+    label: "{{ _plan.name }} ({{ 'warm' if _plan.warm else 'cold' }}: {{ _plan.vms | join(', ') }})"
+
+- name: Plan | Wait for each Plan to be Ready
+  kubernetes.core.k8s_info:
+    api_version: forklift.konveyor.io/v1beta1
+    kind: Plan
+    namespace: "{{ mtv_namespace }}"
+    name: "{{ item.name }}"
+  register: _plan_state
+  until: >-
+    _plan_state.resources | length > 0 and
+    (_plan_state.resources[0].status.conditions | default([])
+     | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length > 0)
+  retries: "{{ mtv_plan_ready_retries }}"
+  delay: 10
+  loop: "{{ _plans }}"
+  loop_control:
+    label: "{{ item.name }}"
+  failed_when: false
+
+- name: Plan | Show why a Plan is not Ready
+  ansible.builtin.assert:
+    that: >-
+      item.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length > 0
+    fail_msg: >-
+      Plan {{ item.item.name }} is not Ready:
+      {{ item.resources[0].status.conditions | default([]) | rejectattr('type', 'equalto', 'Ready')
+         | map(attribute='message') | join(' | ') }}
+    quiet: true
+  loop: "{{ _plan_state.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: Plan | Start warm precopies now (cutover is set later, after approval)
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('ansible.builtin.template', 'migration.yml.j2') | from_yaml }}"
+  loop: "{{ _plans | selectattr('warm') | map(attribute='name') | list }}"
+  loop_control:
+    loop_var: _plan_name
+
+- name: Plan | Record evidence per VM
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    _p: "{{ _plans | selectattr('vms', 'contains', _vm) | first }}"
+    ev_stage: plan
+    ev_vm: "{{ _vm }}"
+    ev_checks:
+      - id: plan_ready
+        title: MTV Plan created and Ready
+        status: pass
+        detail: "{{ _p.name }} ({{ 'warm' if _p.warm else 'cold' }})"
+      - id: precopy
+        title: Warm precopy started
+        status: info
+        detail: "{{ 'precopies running until the cutover approval' if _p.warm else 'cold: copy starts at cutover' }}"
+    ev_facts:
+      plan: "{{ _p.name }}"
+      warm: "{{ _p.warm }}"
+  loop: "{{ _go }}"
+  loop_control:
+    loop_var: _vm
+
+- name: Plan | Hand the plan list to later nodes
+  ansible.builtin.set_stats:
+    data:
+      mtv_plan_names: "{{ _plans | map(attribute='name') | list }}"
+    per_host: false

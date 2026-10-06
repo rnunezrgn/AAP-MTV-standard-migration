@@ -1,0 +1,37 @@
+---
+# Hostnames should match the vCenter VM names. When they differ, set
+# mtv_vm_name on the host. The same IPs are used before and after migration,
+# which needs preserveStaticIPs and a Multus bridge/VLAN network on OpenShift.
+all:
+  hosts:
+    localhost:
+      ansible_connection: local
+      ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  children:
+    windows_guests:
+      vars:
+        ansible_connection: winrm
+        ansible_port: 5986
+        ansible_winrm_scheme: https
+        ansible_winrm_transport: ntlm          # kerberos or credssp in production
+        ansible_winrm_server_cert_validation: ignore
+        # Injected by the "Windows WinRM (MTV)" credential, so the Linux
+        # Machine credential and the Windows login can live in one job.
+        ansible_user: "{{ win_ansible_user }}"
+        ansible_password: "{{ win_ansible_password }}"
+      hosts:
+        win2022-app01:
+          ansible_host: 10.20.0.31
+        win2025-sql01:
+          ansible_host: 10.20.0.32
+        win11-desk01:
+          ansible_host: 10.20.0.33
+          mtv_vm_name: "Win11 Desk 01"
+    linux_guests:
+      vars:
+        ansible_user: ansible
+      hosts:
+        rhel9-web01:
+          ansible_host: 10.20.0.41
+        rhel8-db01:
+          ansible_host: 10.20.0.42

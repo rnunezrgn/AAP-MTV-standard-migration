@@ -1,0 +1,69 @@
+---
+# Runs after readiness. Marks VMs whose readiness never ran, publishes the
+# pre-check report, and gives the approver a clear go / no-go list.
+- name: Gate | Read readiness evidence
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    namespace: "{{ mtv_evidence_namespace }}"
+    label_selectors:
+      - "mtv.demo/run-id={{ mtv_run_id }}"
+      - "mtv.demo/stage=readiness"
+  register: _ready_cms
+
+- name: Gate | Work out which eligible VMs have no readiness evidence
+  ansible.builtin.set_fact:
+    _ready_names: "{{ _ready_cms.resources | mtv_cm_vms }}"
+    _ready_failed: "{{ _ready_cms.resources | mtv_cm_vms('fail') }}"
+
+- name: Gate | Record missing readiness as a failure
+  ansible.builtin.include_role:
+    name: mtv_common
+    tasks_from: record
+  vars:
+    ev_stage: readiness
+    ev_vm: "{{ _vm }}"
+    ev_checks:
+      - id: readiness_ran
+        title: Guest readiness ran
+        status: fail
+        detail: "No readiness result: the VM is missing from the windows_guests or linux_guests inventory group, or its play did not run"
+  loop: "{{ mtv_decisions | selectattr('eligible') | map(attribute='vm') | reject('in', _ready_names) | list }}"
+  loop_control:
+    loop_var: _vm
+
+- name: Gate | Build the go / no-go lists
+  ansible.builtin.set_fact:
+    mtv_go: >-
+      {{ mtv_decisions | selectattr('eligible') | map(attribute='vm')
+         | select('in', _ready_names) | reject('in', _ready_failed) | list }}
+    mtv_nogo: >-
+      {{ (mtv_decisions | rejectattr('eligible') | map(attribute='vm') | list)
+         + (mtv_decisions | selectattr('eligible') | map(attribute='vm') | reject('in', _ready_names) | list)
+         + _ready_failed }}
+
+- name: Gate | Publish the pre-check report
+  ansible.builtin.include_role:
+    name: mtv_report
+  vars:
+    report_phase: pre
+
+- name: Gate | Go / no-go summary for the approver
+  ansible.builtin.debug:
+    msg:
+      - "GO     ({{ mtv_go | length }}): {{ mtv_go | join(', ') or 'none' }}"
+      - "NO-GO  ({{ mtv_nogo | unique | length }}): {{ mtv_nogo | unique | join(', ') or 'none' }}"
+      - "Report: oc extract cm/mtv-report-{{ mtv_run_id }}-pre -n {{ mtv_evidence_namespace }} --keys=report.html --to=."
+
+- name: Gate | Hand the lists to the approval node and later stages
+  ansible.builtin.set_stats:
+    data:
+      mtv_go: "{{ mtv_go }}"
+      mtv_nogo: "{{ mtv_nogo | unique }}"
+    per_host: false
+
+- name: Gate | Stop the workflow when nothing can migrate
+  ansible.builtin.assert:
+    that: mtv_go | length > 0
+    fail_msg: "No VM passed discovery, decision and readiness. Fix the blockers in the pre-check report and relaunch."
+    quiet: true

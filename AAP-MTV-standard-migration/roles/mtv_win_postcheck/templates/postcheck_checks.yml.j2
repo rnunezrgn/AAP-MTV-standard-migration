@@ -1,0 +1,74 @@
+{% set pre_ips = pre.network | default([]) | map(attribute='ipv4') | flatten | list %}
+{% set post_ips = post.network | map(attribute='ipv4') | flatten | list %}
+{% set lost_ips = pre_ips | reject('in', post_ips) | list %}
+{% set pre_dns = pre.network | default([]) | map(attribute='dns') | flatten | unique | sort %}
+{% set post_dns = post.network | map(attribute='dns') | flatten | unique | sort %}
+{% set pre_on = pre.bitlocker | default([]) | selectattr('protection', 'equalto', 'On') | map(attribute='mount') | list %}
+{% set post_on = post.bitlocker | selectattr('protection', 'equalto', 'On') | map(attribute='mount') | list %}
+{% set sys_vol = post.bitlocker | selectattr('type', 'equalto', 'OperatingSystem') | first | default({}) %}
+{% set new_stopped = post.auto_services_stopped | reject('in', pre.auto_services_stopped | default([])) | list %}
+{% set old_bound = virtio.bound | rejectattr('ok') | list %}
+- id: virtio_storage
+  title: VirtIO storage driver bound
+  status: {{ 'pass' if virtio.storage_ok else 'fail' }}
+  detail: {{ (virtio.bound | selectattr('inf', 'in', ['viostor', 'vioscsi']) | map(attribute='device') | zip(virtio.bound | selectattr('inf', 'in', ['viostor', 'vioscsi']) | map(attribute='version')) | map('join', ' ') | join('; ') or 'none') | to_json }}
+- id: virtio_network
+  title: VirtIO network driver bound
+  status: {{ 'pass' if virtio.network_ok else 'fail' }}
+  detail: {{ (virtio.bound | selectattr('inf', 'equalto', 'netkvm') | map(attribute='version') | join(', ') or 'none') | to_json }}
+- id: virtio_current
+  title: VirtIO drivers at or above the staged baseline
+  status: {{ 'pass' if not old_bound else 'warn' }}
+  detail: {{ (('older: ' ~ (old_bound | map(attribute='inf') | join(', '))) if old_bound else (('updated from ISO; ' if virtio.updated else '') ~ 'all current')) | to_json }}
+- id: guest_agent
+  title: QEMU guest agent running
+  status: {{ 'pass' if post.guest_agent == 'Running' else 'fail' }}
+  detail: {{ post.guest_agent | to_json }}
+- id: vmware_remnants
+  title: VMware Tools, services, drivers and ghost devices removed
+  status: {{ 'pass' if after.count == 0 else ('warn' if not removed.errors else 'fail') }}
+  detail: {{ ((removed.removed | length) ~ ' item(s) removed, ' ~ after.count ~ ' remaining'
+             ~ ((': ' ~ (removed.errors | join('; '))) if removed.errors else '')
+             ~ ((' manual: ' ~ (removed.manual | join('; '))) if removed.manual else '')) | to_json }}
+- id: ip_preserved
+  title: IP addresses preserved
+  status: {{ 'pass' if not lost_ips else 'fail' }}
+  detail: {{ (('missing ' ~ (lost_ips | join(', '))) if lost_ips else (post_ips | join(', '))) | to_json }}
+- id: dns_preserved
+  title: DNS servers preserved
+  status: {{ 'pass' if pre_dns == post_dns else 'warn' }}
+  detail: {{ ('before ' ~ (pre_dns | join(',')) ~ ' after ' ~ (post_dns | join(','))) | to_json }}
+- id: domain
+  title: Domain secure channel
+{% if post.domain.joined %}
+  status: {{ 'pass' if post.domain.secure_channel else 'fail' }}
+  detail: {{ (post.domain.name ~ ': ' ~ ('ok' if post.domain.secure_channel else 'broken: Test-ComputerSecureChannel -Repair')) | to_json }}
+{% else %}
+  status: info
+  detail: "workgroup"
+{% endif %}
+- id: secure_boot
+  title: Secure Boot unchanged
+  status: {{ 'pass' if (pre.secure_boot | default(false)) == post.secure_boot else 'fail' }}
+  detail: {{ ('before ' ~ ('on' if pre.secure_boot | default(false) else 'off') ~ ', after ' ~ ('on' if post.secure_boot else 'off')) | to_json }}
+- id: tpm
+  title: vTPM present and ready
+  status: {{ 'pass' if post.tpm.present and post.tpm.ready else ('fail' if pre_on else 'warn') }}
+  detail: {{ ('present=' ~ post.tpm.present ~ ', ready=' ~ post.tpm.ready) | to_json }}
+- id: bitlocker
+  title: BitLocker protection resumed and sealed to the new vTPM
+{% if not pre_on %}
+  status: pass
+  detail: "BitLocker was not protecting any volume"
+{% else %}
+{% set resumed = pre_on | reject('in', post_on) | list | length == 0 %}
+{% set sealed = 'Tpm' in sys_vol.protectors | default([]) %}
+{% set manual = reseal.manual | default([]) %}
+  status: {{ 'warn' if manual else ('pass' if resumed and sealed else 'fail') }}
+  detail: {{ ('protected: ' ~ (post_on | join(', ') or 'none') ~ '; OS protectors: ' ~ (sys_vol.protectors | default([]) | join(', '))
+             ~ ((' | manual: ' ~ (reseal.manual | join('; '))) if reseal.manual | default([]) else '')) | to_json }}
+{% endif %}
+- id: services
+  title: No new stopped automatic services
+  status: {{ 'pass' if not new_stopped else 'warn' }}
+  detail: {{ (new_stopped | join(', ') or 'none') | to_json }}
