@@ -1,0 +1,15 @@
+localhost ansible_connection=local ansible_python_interpreter="{{ ansible_playbook_python }}"
+[windows_guests]
+winweb01-user1 ansible_host=<IP>
+winweb02-user1 ansible_host=<IP>
+[linux_guests]
+database-user1 ansible_host=<IP>
+haproxy-user1 ansible_host=<IP>
+[windows_guests:vars]
+ansible_connection=winrm
+ansible_port=5986
+ansible_winrm_scheme=https
+ansible_winrm_transport=ntlm
+ansible_winrm_server_cert_validation=ignore
+ansible_user="{{ win_ansible_user }}"
+ansible_password="{{ win_ansible_password }}"

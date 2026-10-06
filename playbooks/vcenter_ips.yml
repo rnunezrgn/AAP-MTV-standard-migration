@@ -1,0 +1,52 @@
+---
+# Reads power state, guest OS and IP addresses for each VM from vCenter.
+# Uses the same VMware vCenter credential as "MTV | 01 Discover".
+# vCenter only knows a guest's IPs while the VM is powered on with VMware Tools running.
+- name: Read VM IP addresses from vCenter
+  hosts: localhost
+  gather_facts: false
+  vars:
+    vcenter_datacenter: RS00
+    vcenter_validate_certs: false
+    migration_vms:
+      - database-user1
+      - winweb01-user1
+      - winweb02-user1
+      - haproxy-user1
+  tasks:
+    - name: Read guest details
+      community.vmware.vmware_guest_info:
+        datacenter: "{{ vcenter_datacenter }}"
+        name: "{{ item }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        schema: vsphere
+        properties:
+          - config.guestFullName
+          - runtime.powerState
+          - guest.toolsRunningStatus
+          - guest.hostName
+          - guest.ipAddress
+          - guest.net
+      loop: "{{ migration_vms }}"
+      register: _vms
+      failed_when: false
+
+    - name: Show one line per VM
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item }} |
+          {{ _i.runtime.powerState | default('not found: ' ~ item.msg | default('')) }} |
+          {{ _i.config.guestFullName | default('-') }} |
+          tools: {{ _g.toolsRunningStatus | default('-') }} |
+          hostname: {{ _g.hostName | default('-', true) }} |
+          IPs: {{ _ips | join(', ') or 'none reported' }}
+      vars:
+        _i: "{{ item.instance | default({}) }}"
+        _g: "{{ _i.guest | default({}) }}"
+        _nic_ips: >-
+          {{ _g.net | default([], true) | map(attribute='ipAddress', default=[]) | select | flatten
+             | reject('search', ':') | list }}
+        _ips: "{{ (_nic_ips + ([_g.ipAddress] if _g.ipAddress | default('', true) else [])) | unique }}"
+      loop: "{{ _vms.results }}"
+      loop_control:
+        label: "{{ item.item }}"
