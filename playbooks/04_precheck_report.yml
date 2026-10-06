@@ -14,3 +14,9 @@
     - name: Gate
       ansible.builtin.include_role:
         name: mtv_gate
+
+    - name: Pass the selected VM names to later workflow nodes
+      ansible.builtin.set_stats:
+        data:
+          user_selected_vm_names: "{{ mtv_go | join(',') }}"
+        per_host: false
