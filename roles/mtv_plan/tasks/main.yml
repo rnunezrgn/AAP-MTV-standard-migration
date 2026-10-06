@@ -48,7 +48,8 @@
   ansible.builtin.debug:
     msg:
       - "VM details from: {{ _maps.origin | dict2items | map(attribute='key') | zip(_maps.origin | dict2items | map(attribute='value')) | map('join', ' = ') | join(', ') }}"
-      - "Networks: {{ _maps.network | map(attribute='source') | list }}"
+      - "network_mappings given: {{ network_mappings | map(attribute='source') | list }}"
+      - "Networks: {{ _maps.network | map(attribute='source') | list }}{{ ' (VM networks unknown for ' ~ (_maps.networks_unknown | join(', ')) ~ ': using every mapping given)' if _maps.networks_unknown else '' }}"
       - "Datastores: {{ _maps.storage | map(attribute='source') | list }} -> {{ mtv_target_storage_class }}"
 
 - name: Plan | Every VM network needs an entry in network_mappings
@@ -58,6 +59,15 @@
       MTV sees these VM networks, and network_mappings has no entry for them:
       {{ _maps.unmapped | join('; ') }}.
       Add each one as a source (by name or id), or add a catch-all entry with source "*".
+    quiet: true
+
+- name: Plan | A NetworkMap needs at least one source network
+  ansible.builtin.assert:
+    that: _maps.network | length > 0
+    fail_msg: >-
+      {{ "network_mappings is empty in this job's variables. Add it to the Variables of this job template (or of the workflow)."
+         if network_mappings | length == 0 else
+         "None of the network_mappings entries could be used: " ~ (network_mappings | map(attribute='source') | join(', ')) }}
     quiet: true
 
 - name: Plan | A StorageMap needs at least one source datastore

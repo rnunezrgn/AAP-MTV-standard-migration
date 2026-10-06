@@ -185,4 +185,11 @@ assert mtv.mtv_maps([blank], by_name, SC, inventory={}, all_datastores=["datasto
     {"source": {"id": "datastore-7"}, "destination": {"storageClass": SC}}, {"source": {"id": "datastore-9"}, "destination": {"storageClass": SC}}]
 assert mtv.mtv_maps([blank], by_name, SC, inventory=iv, source_datastores=["ws"])["storage"] == [{"source": {"name": "ws"}, "destination": {"storageClass": SC}}]
 assert mtv.mtv_maps([blank], by_name, SC)["storage"] == []
+# VM networks unknown everywhere: every mapping given goes into the map
+mk = mtv.mtv_maps([blank], by_name, SC, inventory={}, default_namespace="migrated-vms")
+assert mk["network"] == [{"source": {"name": "segment-migrating-to-ocpvirt"}, "destination": {"type": "pod"}}] and mk["networks_unknown"] == ["winweb01-user1"], mk
+mk2 = mtv.mtv_maps([blank], [{"source": "dvportgroup:dvportgroup-210", "type": "pod"}, {"source": "*", "type": "pod"}, {"source": "network-5", "type": "multus", "name": "n"}], SC, default_namespace="ns")
+assert [e["source"] for e in mk2["network"]] == [{"id": "dvportgroup-210"}, {"id": "network-5"}], mk2
+assert mtv.mtv_maps([blank], [], SC)["network"] == [] and mtv.mtv_maps([blank], [{"source": "*", "type": "pod"}], SC)["network"] == []
+assert mv["networks_unknown"] == [] and mp["networks_unknown"] == []
 print("ALL FILTER TESTS PASSED")

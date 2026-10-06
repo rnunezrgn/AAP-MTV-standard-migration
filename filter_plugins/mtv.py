@@ -150,6 +150,20 @@ def mtv_maps(sources, mappings, storage_class, inventory=None, net_names=None,
             seen_net.add(key)
             net.append(e)
 
+    # Nobody told us which networks some VMs use: trust the mappings as given
+    # and let MTV resolve them, rather than send a map that leaves the VM out.
+    unknown = [f.get("vm") for f in rest if not f.get("networks")]
+    if unknown:
+        for m in mappings or []:
+            src = str(m.get("source") or "")
+            if not src or src == "*":
+                continue
+            bare = src.split(":", 1)[1] if src.startswith("dvportgroup:") else src
+            kind = "id" if re.match(r"^(dvportgroup|network)-\d+$", bare) else "name"
+            if bare not in seen_net:
+                seen_net.add(bare)
+                net.append({"source": {kind: bare}, "destination": _net_destination(m, default_namespace)})
+
     if source_datastores:
         sto = mtv_storage_entries([], storage_class, source_datastores)
     else:
@@ -161,7 +175,8 @@ def mtv_maps(sources, mappings, storage_class, inventory=None, net_names=None,
         sto = mtv_storage_entries(rest, storage_class, None, ids)
         if not sto:
             sto = mtv_storage_entries([], storage_class, None, list(all_datastores or []))
-    return {"network": net, "storage": sto, "unmapped": unmapped, "origin": origin}
+    return {"network": net, "storage": sto, "unmapped": unmapped, "origin": origin,
+            "networks_unknown": unknown}
 
 
 def mtv_net_entries(mappings, sources, default_namespace=""):
