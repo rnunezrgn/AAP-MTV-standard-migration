@@ -11,6 +11,12 @@
         name: mtv_common
         tasks_from: load_run
 
+    - name: Check the provider's VDDK image
+      ansible.builtin.include_tasks: tasks/vddk.yml
+      vars:
+        provider_name: "{{ mtv_source_provider }}"
+        migration_namespace: "{{ mtv_source_provider_namespace }}"
+
     - name: Create plans
       ansible.builtin.include_role:
         name: mtv_plan

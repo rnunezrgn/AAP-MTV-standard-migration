@@ -1,9 +1,12 @@
 ---
+# Inside a workflow every node uses the workflow's job number as the run id,
+# so all nodes of one run agree and each run is separate. Launched on its own,
+# a template uses run_id (saved in its variables or given at launch).
 - name: Common | Resolve the run id and the VM list
   ansible.builtin.set_fact:
     mtv_run_id: >-
-      {{ (run_id | default(awx_workflow_job_id | default(tower_workflow_job_id
-          | default(awx_job_id | default('manual'))))) | string }}
+      {{ (awx_workflow_job_id | default(tower_workflow_job_id
+          | default(run_id | default(awx_job_id | default('manual'))))) | string }}
     mtv_vms: >-
       {{ ((migration_vms if migration_vms is not string
           else (migration_vms | regex_replace('[,;\s]+', ' ') | trim | split(' ')))

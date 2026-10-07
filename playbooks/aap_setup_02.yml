@@ -1,0 +1,429 @@
+---
+# AAP setup 02: builds the whole demo in a new lab through the controller API.
+# You create one job template by hand (this one); it creates everything else:
+#
+#   - job templates for 01 to 11 and 90, plus "Lab migrate" and
+#     "Post-check and report", each with its credentials and variables
+#   - the workflow "MTV | Demo workflow":
+#       01 Discover > 02 Decide > 03 Readiness > 04 Pre-check report >
+#       approval > Lab migrate > Post-check and report
+#
+# Project, inventory and execution environment are copied from the job
+# template this playbook runs from. It launches nothing, and can be run again:
+# it updates what it created.
+#
+# Needs a "Red Hat Ansible Automation Platform" credential on its own job
+# template (controller URL, user, password).
+- name: AAP setup 02 | Build the MTV demo in this lab
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # ---- connection (from the AAP credential) -----------------------------
+    controller_host: "{{ lookup('env', 'CONTROLLER_HOST') or lookup('env', 'AAP_HOSTNAME') or lookup('env', 'TOWER_HOST') }}"
+    controller_username: "{{ lookup('env', 'CONTROLLER_USERNAME') or lookup('env', 'AAP_USERNAME') or lookup('env', 'TOWER_USERNAME') }}"
+    controller_password: "{{ lookup('env', 'CONTROLLER_PASSWORD') or lookup('env', 'AAP_PASSWORD') or lookup('env', 'TOWER_PASSWORD') }}"
+    controller_token: "{{ lookup('env', 'CONTROLLER_OAUTH_TOKEN') or lookup('env', 'AAP_TOKEN') or lookup('env', 'TOWER_OAUTH_TOKEN') }}"
+    controller_validate_certs: false
+
+    # ---- this lab ----------------------------------------------------------
+    # Names of the credentials as they appear in AAP > Credentials
+    openshift_credential_name: kubeconfig
+    vcenter_credential_name: VMware Credentials
+    # VM offered by default in the workflow survey
+    default_vms: database-user1
+    # Saved on every template and passed to every workflow node
+    lab_vars:
+      vmware_host: vcenter.apps.ocpv06.rhdp.net
+      vcenter_datacenter: RS00
+      migration_mode: cold
+      mtv_guest_checks: false
+      mtv_source_provider: vmware
+      mtv_destination_provider: host
+      mtv_target_namespace: migrated-vms
+      mtv_target_storage_class: ocs-external-storagecluster-ceph-rbd
+      mtv_preserve_static_ips: false
+      cold_graceful_shutdown: false
+      target_add_vtpm_windows: false
+      target_agent_retries: 18
+      network_mappings:
+        - { source: segment-migrating-to-ocpvirt, type: pod }
+        - { source: "*", type: pod }
+      source_network: segment-migrating-to-ocpvirt
+      source_datastores: [workloadshare]
+      # Lab migrate
+      plan_name: aap-demo
+      unique_names: true
+      networkmap_name: aap-networkmap
+      storagemap_name: aap-storagemap
+      migration_target_namespace: aap-demo
+      target_storage_class: ocs-external-storagecluster-ceph-rbd
+    # Only on the templates, for launching one on its own. Inside a workflow
+    # every node uses the workflow's run number instead.
+    standalone_vars:
+      run_id: demo1
+
+    # ---- what gets created ---------------------------------------------------
+    workflow_name: "MTV | Demo workflow"
+    approval_name: "Approve the migration"
+    workflow_order: [discover, decide, readiness, precheck, APPROVAL, migrate, post]
+    templates:
+      - { key: discover, name: "MTV | 01 Discover", playbook: playbooks/01_discover.yml, vcenter: true }
+      - { key: decide, name: "MTV | 02 Decide", playbook: playbooks/02_decide.yml, vcenter: false }
+      - { key: readiness, name: "MTV | 03 Guest readiness", playbook: playbooks/03_readiness.yml, vcenter: false }
+      - { key: precheck, name: "MTV | 04 Pre-check report", playbook: playbooks/04_precheck_report.yml, vcenter: false }
+      - { key: tune, name: "MTV | 05 Tune MTV", playbook: playbooks/05_tune_mtv.yml, vcenter: false }
+      - { key: plans, name: "MTV | 06 Create plans", playbook: playbooks/06_create_plans.yml, vcenter: false }
+      - { key: cutover_prep, name: "MTV | 07 Cutover prep", playbook: playbooks/07_cutover_prep.yml, vcenter: false }
+      - { key: cutover, name: "MTV | 08 Execute cutover", playbook: playbooks/08_execute_cutover.yml, vcenter: true }
+      - { key: postcheck, name: "MTV | 09 Post-check", playbook: playbooks/09_postcheck.yml, vcenter: false }
+      - { key: restore, name: "MTV | 10 Restore MTV", playbook: playbooks/10_restore_mtv.yml, vcenter: false }
+      - { key: report, name: "MTV | 11 Report", playbook: playbooks/11_report.yml, vcenter: false }
+      - { key: rollback, name: "MTV | 90 Rollback", playbook: playbooks/90_rollback.yml, vcenter: true }
+      - { key: migrate, name: "MTV | Lab migrate", playbook: playbooks/lab_migrate.yml, vcenter: false }
+      - { key: post, name: "MTV | Post-check and report", playbook: playbooks/lab_post.yml, vcenter: false }
+
+  module_defaults:
+    ansible.builtin.uri:
+      url_username: "{{ omit if controller_token else controller_username }}"
+      url_password: "{{ omit if controller_token else controller_password }}"
+      force_basic_auth: "{{ not (controller_token | length > 0) }}"
+      headers: "{{ {'Authorization': 'Bearer ' ~ controller_token} if controller_token else {} }}"
+      validate_certs: "{{ controller_validate_certs }}"
+      body_format: json
+      return_content: true
+      timeout: 60
+
+  tasks:
+    # ------------------------------------------------------------------ API
+    - name: The controller address and a login are needed
+      ansible.builtin.assert:
+        that:
+          - controller_host | length > 0
+          - (controller_token | length > 0) or (controller_username | length > 0 and controller_password | length > 0)
+        fail_msg: >-
+          No controller login was passed to this job. Attach a credential of type
+          "Red Hat Ansible Automation Platform" to this job template.
+        quiet: true
+
+    - name: Find the controller API
+      ansible.builtin.uri:
+        url: "{{ _host }}{{ item }}ping/"
+        status_code: [200, 301, 302, 401, 403, 404]
+      loop: ["/api/controller/v2/", "/api/v2/"]
+      register: _ping
+      vars:
+        _host: "{{ ('https://' ~ controller_host) if '://' not in controller_host else controller_host | regex_replace('/+$', '') }}"
+
+    - name: Remember the API address
+      ansible.builtin.set_fact:
+        api: >-
+          {{ (('https://' ~ controller_host) if '://' not in controller_host else controller_host | regex_replace('/+$', ''))
+             ~ (_ping.results | selectattr('status', 'equalto', 200) | map(attribute='item') | first | default('')) }}
+        _api_found: "{{ _ping.results | selectattr('status', 'equalto', 200) | list | length > 0 }}"
+
+    - name: The controller API must answer
+      ansible.builtin.assert:
+        that: _api_found
+        fail_msg: >-
+          Could not reach the controller API at {{ controller_host }}
+          (answers: {{ _ping.results | map(attribute='status') | join(', ') }}).
+          Check the URL in the AAP credential.
+        quiet: true
+
+    # ------------------------------- project, inventory, execution environment
+    - name: This playbook must run from a job template
+      ansible.builtin.assert:
+        that: (awx_job_template_id | default(tower_job_template_id | default(''))) | string | length > 0
+        fail_msg: >-
+          Run this from a job template in AAP. It copies the project, inventory and
+          execution environment from that template.
+        quiet: true
+
+    - name: Read the job template this setup runs from
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/{{ awx_job_template_id | default(tower_job_template_id) }}/"
+      register: _self_jt
+
+    - name: Keep its project, inventory and execution environment
+      ansible.builtin.set_fact:
+        base: "{{ _self_jt.json }}"
+
+    - name: Sync the project
+      ansible.builtin.uri:
+        url: "{{ api }}projects/{{ base.project }}/update/"
+        method: POST
+        body: {}
+        status_code: [200, 201, 202]
+      register: _sync
+
+    - name: Wait for the sync
+      ansible.builtin.uri:
+        url: "{{ api }}project_updates/{{ _sync.json.id | default(_sync.json.project_update) }}/"
+      register: _sync_state
+      until: _sync_state.json.status in ['successful', 'failed', 'error', 'canceled']
+      retries: 60
+      delay: 5
+
+    - name: The sync must succeed
+      ansible.builtin.assert:
+        that: _sync_state.json.status == 'successful'
+        fail_msg: "The project sync ended as {{ _sync_state.json.status }}. Open the project in AAP and check its last sync."
+        quiet: true
+
+    - name: Read the playbooks in the project
+      ansible.builtin.uri:
+        url: "{{ api }}projects/{{ base.project }}/playbooks/"
+      register: _playbooks
+
+    - name: Every playbook must be in the project
+      ansible.builtin.assert:
+        that: (templates | map(attribute='playbook') | difference(_playbooks.json)) | length == 0
+        fail_msg: >-
+          These playbooks are not in the project:
+          {{ templates | map(attribute='playbook') | difference(_playbooks.json) | join(', ') }}.
+          Commit and push them to the repository this project uses, then run this again.
+        quiet: true
+
+    # ----------------------------------------------------------- credentials
+    - name: Read the credentials in AAP
+      ansible.builtin.uri:
+        url: "{{ api }}credentials/?page_size=200"
+      register: _creds
+
+    - name: Find the OpenShift and vCenter credentials by name
+      ansible.builtin.set_fact:
+        ocp_cred: "{{ _creds.json.results | selectattr('name', 'equalto', openshift_credential_name) | first | default({}) }}"
+        vc_cred: "{{ _creds.json.results | selectattr('name', 'equalto', vcenter_credential_name) | first | default({}) }}"
+
+    - name: Both credentials must exist
+      ansible.builtin.assert:
+        that:
+          - ocp_cred.id is defined
+          - vc_cred.id is defined
+        fail_msg: >-
+          {{ 'No credential named "' ~ openshift_credential_name ~ '". ' if ocp_cred.id is not defined else '' }}{{
+             'No credential named "' ~ vcenter_credential_name ~ '". ' if vc_cred.id is not defined else '' }}AAP
+          has these credentials: {{ _creds.json.results | map(attribute='name') | join(', ') }}.
+          Set openshift_credential_name and vcenter_credential_name to the right ones in this template's Variables.
+        quiet: true
+
+    # ------------------------------------------------------------- templates
+    - name: Variables saved on every template
+      ansible.builtin.set_fact:
+        _template_vars: "{{ lab_vars | combine(standalone_vars) | combine({'migration_vms': default_vms}) | to_nice_yaml }}"
+
+    - name: Look for existing job templates
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/?playbook={{ item.playbook | urlencode }}&order_by=-modified"
+      loop: "{{ templates }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _lookup
+
+    # Related fields are sent as numbers, and left out when not set.
+    - name: Create the job templates that do not exist yet
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/"
+        method: POST
+        body: &jt_body >-
+          {{ {'name': (item.json.results[0].name if item.json.count | int > 0 else item.item.name),
+              'description': 'Set up by aap_setup_02.yml',
+              'job_type': 'run',
+              'project': base.project | int,
+              'playbook': item.item.playbook,
+              'ask_variables_on_launch': true,
+              'extra_vars': _template_vars}
+             | combine({'inventory': base.inventory | int} if base.inventory else {})
+             | combine({'execution_environment': base.execution_environment | int} if base.execution_environment else {}) }}
+        status_code: [201]
+      loop: "{{ _lookup.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.json.count | int == 0
+
+    - name: Update the job templates that already exist
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/{{ item.json.results[0].id }}/"
+        method: PATCH
+        body: *jt_body
+        status_code: [200]
+      loop: "{{ _lookup.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.json.count | int > 0
+
+    - name: Read the job templates back
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/?playbook={{ item.playbook | urlencode }}&order_by=-modified"
+      loop: "{{ templates }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _jts_read
+
+    - name: Keep them by key
+      ansible.builtin.set_fact:
+        jts: "{{ dict(templates | map(attribute='key') | zip(_jts_read.results | map(attribute='json.results') | map('first'))) }}"
+
+    # AAP refuses a second credential of the same type on a template; that
+    # answer (400) is checked below instead of stopping here.
+    - name: Attach the OpenShift credential to every template
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/{{ jts[item.key].id }}/credentials/"
+        method: POST
+        body: "{{ {'id': ocp_cred.id | int} }}"
+        status_code: [204, 200, 201, 400]
+      loop: "{{ templates }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: ocp_cred.id not in (jts[item.key].summary_fields.credentials | default([]) | map(attribute='id') | list)
+
+    - name: Attach the vCenter credential to the templates that talk to vCenter
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/{{ jts[item.key].id }}/credentials/"
+        method: POST
+        body: "{{ {'id': vc_cred.id | int} }}"
+        status_code: [204, 200, 201, 400]
+      loop: "{{ templates | selectattr('vcenter') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: vc_cred.id not in (jts[item.key].summary_fields.credentials | default([]) | map(attribute='id') | list)
+
+    - name: Read the templates once more
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/{{ jts[item.key].id }}/"
+      loop: "{{ templates }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _jts_final
+
+    - name: Every template must have its credentials
+      ansible.builtin.assert:
+        that:
+          - ocp_cred.id in (item.json.summary_fields.credentials | default([]) | map(attribute='id') | list)
+          - (not item.item.vcenter) or (vc_cred.id in (item.json.summary_fields.credentials | default([]) | map(attribute='id') | list))
+        fail_msg: >-
+          Template "{{ item.json.name }}" has these credentials:
+          {{ item.json.summary_fields.credentials | default([]) | map(attribute='name') | join(', ') or 'none' }}.
+          It needs "{{ openshift_credential_name }}"{{ ' and "' ~ vcenter_credential_name ~ '"' if item.item.vcenter else '' }}.
+          Remove the credential of the same type from it in AAP, then run this again.
+        quiet: true
+      loop: "{{ _jts_final.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    # ---------------------------------------------------------- the workflow
+    - name: Look for the workflow
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/?name={{ workflow_name | urlencode }}"
+      register: _wf_lookup
+
+    - name: Settings for the workflow
+      ansible.builtin.set_fact:
+        _wf_body: >-
+          {{ {'name': workflow_name,
+              'description': 'Discover, decide, readiness, pre-check report, approval, migrate, post-check and report (set up by aap_setup_02.yml)',
+              'extra_vars': lab_vars | to_nice_yaml,
+              'survey_enabled': true,
+              'allow_simultaneous': false}
+             | combine({'organization': base.organization | int} if base.organization else {}) }}
+
+    - name: Create the workflow
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/"
+        method: POST
+        body: "{{ _wf_body | combine({'survey_enabled': false}) }}"
+        status_code: [201]
+      register: _wf_created
+      when: _wf_lookup.json.count | int == 0
+
+    - name: Remember the workflow id
+      ansible.builtin.set_fact:
+        wf_id: "{{ _wf_created.json.id if _wf_lookup.json.count | int == 0 else _wf_lookup.json.results[0].id }}"
+
+    - name: Set the survey (which VMs to migrate)
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/{{ wf_id }}/survey_spec/"
+        method: POST
+        body:
+          name: Migration run
+          description: VMs for this run
+          spec:
+            - question_name: VMs to migrate
+              question_description: vCenter VM names, one per line
+              variable: migration_vms
+              type: textarea
+              required: true
+              default: "{{ default_vms }}"
+        status_code: [200, 201, 204]
+
+    - name: Update the workflow settings
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/{{ wf_id }}/"
+        method: PATCH
+        body: "{{ _wf_body }}"
+        status_code: [200]
+
+    - name: Read the workflow's current nodes
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/{{ wf_id }}/workflow_nodes/?page_size=200"
+      register: _old_nodes
+
+    - name: Remove them (the workflow is rebuilt from scratch)
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_template_nodes/{{ item.id }}/"
+        method: DELETE
+        status_code: [204, 404]
+      loop: "{{ _old_nodes.json.results }}"
+      loop_control:
+        label: "{{ item.identifier | default(item.id) }}"
+
+    - name: Add the nodes
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/{{ wf_id }}/workflow_nodes/"
+        method: POST
+        body: >-
+          {{ {'identifier': item | lower}
+             | combine({} if item == 'APPROVAL' else {'unified_job_template': jts[item].id | int}) }}
+        status_code: [201]
+      loop: "{{ workflow_order }}"
+      register: _nodes
+
+    - name: Make the approval node an approval
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_template_nodes/{{ item.json.id }}/create_approval_template/"
+        method: POST
+        body:
+          name: "{{ approval_name }}"
+          description: "Read the pre-check report from node 04, then approve to start the migration"
+          timeout: 0
+        status_code: [200, 201]
+      loop: "{{ _nodes.results | selectattr('item', 'equalto', 'APPROVAL') | list }}"
+      loop_control:
+        label: "{{ approval_name }}"
+
+    - name: Put the nodes in order
+      ansible.builtin.set_fact:
+        _chain: "{{ _nodes.results | map(attribute='json.id') | list }}"
+
+    - name: Link each node to the next one (on success)
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_template_nodes/{{ item.0 }}/success_nodes/"
+        method: POST
+        body: "{{ {'id': item.1 | int} }}"
+        status_code: [204, 200, 201]
+      loop: "{{ _chain[:-1] | zip(_chain[1:]) | list }}"
+      loop_control:
+        label: "{{ item.0 }} -> {{ item.1 }}"
+
+    # ---------------------------------------------------------------- done
+    - name: Done
+      ansible.builtin.debug:
+        msg:
+          - "Templates ready ({{ templates | length }}): {{ _jts_final.results | map(attribute='json.name') | join(', ') }}"
+          - "Credentials: {{ openshift_credential_name }} on all of them; {{ vcenter_credential_name }} on {{ templates | selectattr('vcenter') | map(attribute='name') | join(', ') }}"
+          - "Workflow ready: {{ workflow_name }}"
+          - "Order: {{ workflow_order | map('extract', _names) | join('  >  ') }}"
+          - "To run the demo: Templates > {{ workflow_name }} > Launch, enter the VM names, approve when asked."
+          - "Each run creates plan aap-demo-<run number> in namespace aap-demo-<run number>, so it can be launched again without cleanup."
+      vars:
+        _names: "{{ dict(templates | map(attribute='key') | zip(templates | map(attribute='name'))) | combine({'APPROVAL': approval_name}) }}"
