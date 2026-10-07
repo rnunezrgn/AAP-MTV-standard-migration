@@ -293,4 +293,6 @@
       ansible.builtin.set_stats:
         data:
           mtv_plan_names: ["{{ _plan_name }}"]
+          lab_plan_name: "{{ _plan_name }}"
+          lab_target_namespace: "{{ _target_ns }}"
         per_host: false

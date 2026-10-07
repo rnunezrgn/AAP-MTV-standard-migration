@@ -192,4 +192,28 @@ mk2 = mtv.mtv_maps([blank], [{"source": "dvportgroup:dvportgroup-210", "type": "
 assert [e["source"] for e in mk2["network"]] == [{"id": "dvportgroup-210"}, {"id": "network-5"}], mk2
 assert mtv.mtv_maps([blank], [], SC)["network"] == [] and mtv.mtv_maps([blank], [{"source": "*", "type": "pod"}], SC)["network"] == []
 assert mv["networks_unknown"] == [] and mp["networks_unknown"] == []
+# Lab post-migration helpers
+lp = {"metadata": {"name": "aap-demo-812"}, "spec": {"targetNamespace": "aap-demo-812", "vms": [{"name": "database-user1"}, {"id": "vm-102", "name": "winweb01-user1"}, {"name": "never-ran"}]},
+      "status": {"migration": {"vms": [
+          {"id": "vm-101", "name": "database-user1", "phase": "Completed", "conditions": [{"type": "Succeeded", "status": "True"}],
+           "pipeline": [{"name": "DiskTransfer", "phase": "Completed"}], "started": "t0", "completed": "t1"},
+          {"id": "vm-102", "phase": "Completed", "error": {"reasons": ["disk copy failed"]}, "conditions": [{"type": "Failed", "status": "True"}], "pipeline": []}]}}}
+lo = mtv.mtv_lab_outcomes(lp)
+assert [(o["vm"], o["ok"], o["target_name"]) for o in lo] == [("database-user1", True, "database-user1"), ("winweb01-user1", False, "winweb01-user1"), ("never-ran", False, "never-ran")], lo
+assert mtv.mtv_lab_outcomes({}) == [] and mtv.mtv_lab_outcomes(None) == []
+kvms = [{"metadata": {"name": "other", "namespace": "aap-demo-812"}}, {"metadata": {"name": "db-renamed", "namespace": "aap-demo-812", "labels": {"vmID": "vm-101"}}}]
+lm = mtv.mtv_lab_match(lo, kvms)
+assert lm[0]["target"] == {"name": "db-renamed", "namespace": "aap-demo-812", "uses_running": False} and lm[1]["target"] is None
+assert mtv.mtv_lab_match(lo, [{"metadata": {"name": "database-user1"}, "spec": {"running": False}}])[0]["target"]["uses_running"] is True
+assert mtv.mtv_lab_match(lo, [{"metadata": {"name": "database-user1", "namespace": "n"}}])[0]["target"]["name"] == "database-user1"
+vmi = {"resources": [{"status": {"phase": "Running", "nodeName": "worker-1", "interfaces": [{"ipAddress": "10.128.2.9", "ipAddresses": ["10.128.2.9", "fe80::1"]}],
+                                 "conditions": [{"type": "AgentConnected", "status": "True"}]}}]}
+lt = mtv.mtv_lab_target(lm[0], vmi)
+assert mtv.mtv_result(lt["checks"]) == "pass" and lt["ips"] == ["10.128.2.9"] and lt["phase"] == "Running", lt
+assert mtv.mtv_result(mtv.mtv_lab_target(lm[0], {"resources": []})["checks"]) == "warn"
+assert mtv.mtv_result(mtv.mtv_lab_target(dict(lm[0], target=None), None)["checks"]) == "fail"
+assert mtv.mtv_result(mtv.mtv_lab_target(lm[1], None)["checks"]) == "pass"      # not checked: info only
+assert mtv.mtv_lab_pair_line((lm[0], lt)) == mtv.mtv_lab_line(lm[0], lt)
+assert mtv.mtv_lab_line(lm[0], lt) == "database-user1: migrated -> aap-demo-812/db-renamed, Running, IP 10.128.2.9"
+assert "NOT migrated" in mtv.mtv_lab_line(lm[1], mtv.mtv_lab_target(lm[1], None)) and "disk copy failed" in mtv.mtv_lab_line(lm[1], {})
 print("ALL FILTER TESTS PASSED")

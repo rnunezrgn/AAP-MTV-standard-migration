@@ -4,9 +4,10 @@
 #   1. finds your existing job templates for nodes 01 to 04 (by playbook path)
 #   2. syncs the project and checks that playbooks/lab_migrate.yml is in it
 #   3. creates or updates the job template "MTV | Lab migrate"
-#   4. creates or rebuilds the workflow "MTV | Demo workflow":
+#   4. creates or updates the job template "MTV | Post-check and report"
+#   5. creates or rebuilds the workflow "MTV | Demo workflow":
 #      01 Discover > 02 Decide > 03 Readiness > 04 Pre-check report >
-#      approval > Lab migrate
+#      approval > Lab migrate > Post-check and report
 #
 # It does not launch anything and does not touch any other template or
 # workflow. Safe to run again: it updates what it created.
@@ -27,6 +28,7 @@
 
     # ---- names of what this playbook creates -------------------------------
     migrate_template_name: "MTV | Lab migrate"
+    post_template_name: "MTV | Post-check and report"
     workflow_name: "MTV | Demo workflow"
     approval_name: "Approve the migration"
 
@@ -59,6 +61,7 @@
       - { key: readiness, playbook: playbooks/03_readiness.yml }
       - { key: precheck, playbook: playbooks/04_precheck_report.yml }
     migrate_playbook: playbooks/lab_migrate.yml
+    post_playbook: playbooks/lab_post.yml
 
   module_defaults:
     ansible.builtin.uri:
@@ -164,13 +167,14 @@
         url: "{{ api }}projects/{{ stage_jts[0].project }}/playbooks/"
       register: _playbooks
 
-    - name: The migration playbook must be in the project
+    - name: The migration and post-check playbooks must be in the project
       ansible.builtin.assert:
-        that: migrate_playbook in _playbooks.json
+        that: item in _playbooks.json
         fail_msg: >-
-          {{ migrate_playbook }} is not in the project. Commit and push it to the repository
+          {{ item }} is not in the project. Commit and push it to the repository
           this project uses, then run this again.
         quiet: true
+      loop: ["{{ migrate_playbook }}", "{{ post_playbook }}"]
 
     # ------------------------------------- OpenShift credential for migrate
     - name: Pick the OpenShift credential from the 04 template
@@ -254,6 +258,61 @@
         - item.id not in (_mig.json.summary_fields.credentials | default([]) | map(attribute='id') | list)
         - item.kind not in (_mig.json.summary_fields.credentials | default([]) | map(attribute='kind') | list)
 
+    # ---------------------------------------- the post-check and report template
+    - name: Look for an existing post-check template
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/?playbook={{ post_playbook | urlencode }}&order_by=-modified"
+      register: _post_lookup
+
+    - name: Settings for the post-check template
+      ansible.builtin.set_fact:
+        _post_body: >-
+          {{ {'name': (_post_lookup.json.results[0].name if _post_lookup.json.count | int > 0 else post_template_name),
+              'description': 'Waits for the migration, starts the VMs and builds the final report (set up by aap_setup.yml)',
+              'job_type': 'run',
+              'project': stage_jts[0].project | int,
+              'playbook': post_playbook,
+              'ask_variables_on_launch': true,
+              'extra_vars': '---\n'}
+             | combine({'inventory': stage_jts[0].inventory | int} if stage_jts[0].inventory else {})
+             | combine({'execution_environment': stage_jts[0].execution_environment | int}
+                       if stage_jts[0].execution_environment else {}) }}
+
+    - name: Create the post-check template
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/"
+        method: POST
+        body: "{{ _post_body }}"
+        status_code: [201]
+      register: _post_created
+      when: _post_lookup.json.count | int == 0
+
+    - name: Update the post-check template
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/{{ _post_lookup.json.results[0].id }}/"
+        method: PATCH
+        body: "{{ _post_body }}"
+        status_code: [200]
+      when: _post_lookup.json.count | int > 0
+
+    - name: Read the post-check template back
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/{{ _post_created.json.id if _post_lookup.json.count | int == 0 else _post_lookup.json.results[0].id }}/"
+      register: _post
+
+    - name: Attach the OpenShift credential to it
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/{{ _post.json.id }}/credentials/"
+        method: POST
+        body: "{{ {'id': item.id | int} }}"
+        status_code: [204, 200, 201]
+      loop: "{{ migrate_creds }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - item.id not in (_post.json.summary_fields.credentials | default([]) | map(attribute='id') | list)
+        - item.kind not in (_post.json.summary_fields.credentials | default([]) | map(attribute='kind') | list)
+
     # --------------------- nodes 01 to 04 must accept the workflow's variables
     - name: Let the 01 to 04 templates take variables from the workflow
       ansible.builtin.uri:
@@ -276,7 +335,7 @@
       ansible.builtin.set_fact:
         _wf_body: >-
           {{ {'name': workflow_name,
-              'description': 'Discover, decide, readiness, pre-check report, approval, migrate (set up by aap_setup.yml)',
+              'description': 'Discover, decide, readiness, pre-check report, approval, migrate, post-check and report (set up by aap_setup.yml)',
               'extra_vars': workflow_vars | to_nice_yaml,
               'survey_enabled': true,
               'allow_simultaneous': false}
@@ -369,9 +428,19 @@
         status_code: [201]
       register: _migrate_node
 
+    - name: Add the post-check and report node
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/{{ wf_id }}/workflow_nodes/"
+        method: POST
+        body: "{{ {'unified_job_template': _post.json.id | int, 'identifier': 'post'} }}"
+        status_code: [201]
+      register: _post_node
+
     - name: Put the nodes in order
       ansible.builtin.set_fact:
-        _chain: "{{ (_stage_nodes.results | map(attribute='json.id') | list) + [_approval_node.json.id, _migrate_node.json.id] }}"
+        _chain: >-
+          {{ (_stage_nodes.results | map(attribute='json.id') | list)
+             + [_approval_node.json.id, _migrate_node.json.id, _post_node.json.id] }}
 
     - name: Link each node to the next one (on success)
       ansible.builtin.uri:
@@ -388,7 +457,8 @@
       ansible.builtin.debug:
         msg:
           - "Workflow ready: {{ workflow_name }}"
-          - "Order: {{ (stage_jts | map(attribute='name') | list + [approval_name, _mig.json.name]) | join('  >  ') }}"
+          - "Order: {{ (stage_jts | map(attribute='name') | list + [approval_name, _mig.json.name, _post.json.name]) | join('  >  ') }}"
           - "Migration template: {{ _mig.json.name }} ({{ migrate_playbook }}), credential: {{ migrate_creds | map(attribute='name') | join(', ') }}"
+          - "Post-check template: {{ _post.json.name }} ({{ post_playbook }}): waits for the migration, starts the VMs, builds the final report"
           - "To run the demo: Templates > {{ workflow_name }} > Launch, enter the VM names, approve when asked."
           - "Each run creates plan aap-demo-<run number> in namespace aap-demo-<run number>, so it can be launched again without cleanup."

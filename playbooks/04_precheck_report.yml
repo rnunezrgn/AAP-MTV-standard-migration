@@ -19,4 +19,5 @@
       ansible.builtin.set_stats:
         data:
           user_selected_vm_names: "{{ mtv_go | join('\n') }}"
+          run_id: "{{ mtv_run_id }}"
         per_host: false

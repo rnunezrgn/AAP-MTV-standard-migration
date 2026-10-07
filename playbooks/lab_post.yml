@@ -1,0 +1,226 @@
+---
+# Post-migration step for the lab workflow. Runs after lab_migrate.yml:
+#   1. waits for the MTV plan to finish
+#   2. starts each migrated VM on OpenShift Virtualization and waits for it
+#   3. records the migration and the target VM as evidence for the run
+#   4. builds the final HTML/JSON report (the same report as node 04, now
+#      with the migration and target stages) and prints a summary
+#
+# It asks vCenter nothing and needs only the OpenShift credential.
+# In the workflow it gets the plan name from lab_migrate.yml and the run id
+# from node 04. On its own, pass plan_name (and run_id for the report).
+- name: "Lab | Wait for the migration, start the VMs and report"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    migration_namespace: openshift-mtv
+    # The plan to follow. In the workflow, lab_migrate.yml passes lab_plan_name
+    # (the real name, with the run number), which wins over plan_name.
+    plan_name: ""
+    # How long to wait for MTV to finish copying, and for each VM to boot
+    migration_wait_minutes: 120
+    start_vms: true
+    vm_start_wait_minutes: 5
+  roles:
+    - mtv_common
+  tasks:
+    - name: Settle which plan to follow
+      ansible.builtin.set_fact:
+        _plan_name: "{{ lab_plan_name | default(plan_name, true) }}"
+
+    - name: A plan name is needed
+      ansible.builtin.assert:
+        that: _plan_name | length > 0
+        fail_msg: >-
+          No plan name was given. Run this after the migration step in the workflow,
+          or set plan_name to the MTV plan to follow.
+        quiet: true
+
+    # ------------------------------------------------------------ migration
+    - name: "Wait for plan {{ _plan_name }} to finish (up to {{ migration_wait_minutes }} minutes)"
+      kubernetes.core.k8s_info:
+        api_version: forklift.konveyor.io/v1beta1
+        kind: Plan
+        namespace: "{{ migration_namespace }}"
+        name: "{{ _plan_name }}"
+      register: _plan
+      until: >-
+        _plan.resources | default([]) | length == 0 or
+        (_plan.resources[0].status.conditions | default([])
+         | selectattr('type', 'in', ['Succeeded', 'Failed', 'Canceled'])
+         | selectattr('status', 'equalto', 'True') | list | length > 0)
+      retries: "{{ (migration_wait_minutes | int) * 3 }}"
+      delay: 20
+      failed_when: false
+
+    - name: The plan must exist
+      ansible.builtin.assert:
+        that: _plan.resources | default([]) | length > 0
+        fail_msg: "Plan {{ _plan_name }} was not found in {{ migration_namespace }}."
+        quiet: true
+
+    - name: Read the result for each VM
+      ansible.builtin.set_fact:
+        _target_ns: "{{ _plan.resources[0].spec.targetNamespace }}"
+        _plan_state: >-
+          {{ _plan.resources[0].status.conditions | default([])
+             | selectattr('type', 'in', ['Succeeded', 'Failed', 'Canceled'])
+             | selectattr('status', 'equalto', 'True') | map(attribute='type') | first | default('still running') }}
+        _outcomes: "{{ _plan.resources[0] | mtv_lab_outcomes }}"
+
+    # ------------------------------------------------------------ target VMs
+    - name: Find the migrated VMs on OpenShift
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        namespace: "{{ _target_ns }}"
+      register: _kvms
+      failed_when: false
+
+    - name: Match them to the source VMs
+      ansible.builtin.set_fact:
+        _outcomes: "{{ _outcomes | mtv_lab_match(_kvms.resources | default([])) }}"
+
+    - name: Start the migrated VMs
+      kubernetes.core.k8s:
+        state: patched
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ item.target.name }}"
+        namespace: "{{ item.target.namespace }}"
+        merge_type: merge
+        definition:
+          spec: "{{ {'running': true} if item.target.uses_running else {'runStrategy': 'Always'} }}"
+      loop: "{{ _outcomes }}"
+      loop_control:
+        label: "{{ item.vm }}"
+      when: start_vms | bool and item.ok and item.target is mapping
+      register: _started
+      failed_when: false
+
+    - name: Wait for each VM to be Running
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ item.target.name }}"
+        namespace: "{{ item.target.namespace }}"
+      loop: "{{ _outcomes }}"
+      loop_control:
+        label: "{{ item.vm }}"
+      when: item.ok and item.target is mapping
+      register: _vmis
+      until: >-
+        _vmis.resources | default([]) | length > 0 and
+        (_vmis.resources[0].status.phase | default('')) == 'Running'
+      retries: "{{ (vm_start_wait_minutes | int) * 6 if start_vms | bool else 1 }}"
+      delay: 10
+      failed_when: false
+
+    # Give the guest agent a moment to report addresses, then read once more.
+    - name: Let the VMs report their addresses
+      ansible.builtin.pause:
+        seconds: 20
+      when: _outcomes | selectattr('ok') | selectattr('target') | list | length > 0
+
+    - name: Read the running VMs
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ item.target.name }}"
+        namespace: "{{ item.target.namespace }}"
+      loop: "{{ _outcomes }}"
+      loop_control:
+        label: "{{ item.vm }}"
+      when: item.ok and item.target is mapping
+      register: _vmis_final
+      failed_when: false
+
+    - name: Work out the state of each target VM
+      ansible.builtin.set_fact:
+        _targets: "{{ _targets | default([]) + [item.0 | mtv_lab_target(item.1)] }}"
+      loop: "{{ _outcomes | zip(_vmis_final.results) | list }}"
+      loop_control:
+        label: "{{ item.0.vm }}"
+
+    # ------------------------------------------------------ evidence + report
+    - name: Is there a pre-check run to add this to?
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ConfigMap
+        namespace: "{{ mtv_evidence_namespace }}"
+        name: "mtv-run-{{ mtv_run_id }}-decisions"
+      register: _run_cm
+      failed_when: false
+
+    - name: Decide whether the full report can be built
+      ansible.builtin.set_fact:
+        _has_run: "{{ _run_cm.resources | default([]) | length > 0 }}"
+
+    - name: Load the pre-check run
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: load_run
+      when: _has_run
+
+    - name: Record the migration result per VM
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: record
+      vars:
+        ev_stage: migrate
+        ev_vm: "{{ _o.vm }}"
+        ev_checks: "{{ _o.checks }}"
+        ev_facts: "{{ _o.facts }}"
+      loop: "{{ _outcomes if _has_run else [] }}"
+      loop_control:
+        loop_var: _o
+        label: "{{ _o.vm }}"
+
+    - name: Record the target VM per VM
+      ansible.builtin.include_role:
+        name: mtv_common
+        tasks_from: record
+      vars:
+        ev_stage: target
+        ev_vm: "{{ _t.vm }}"
+        ev_checks: "{{ _t.checks }}"
+        ev_facts: "{{ _t.facts }}"
+      loop: "{{ _targets | default([]) if _has_run else [] }}"
+      loop_control:
+        loop_var: _t
+        label: "{{ _t.vm }}"
+
+    - name: Build the final report
+      ansible.builtin.include_role:
+        name: mtv_report
+      vars:
+        report_phase: final
+      when: _has_run
+
+    # --------------------------------------------------------------- summary
+    - name: Migration summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['Plan ' ~ _plan_name ~ ': ' ~ _plan_state ~ ', target namespace ' ~ _target_ns]
+             + (_outcomes | zip(_targets | default([])) | map('mtv_lab_pair_line') | list)
+             + ([ 'Report: oc extract cm/mtv-report-' ~ mtv_run_id ~ '-final -n ' ~ mtv_evidence_namespace ~ ' --keys=report.html --to=.' ]
+                if _has_run else
+                [ 'No pre-check run ' ~ mtv_run_id ~ ' was found, so the HTML report was not built.' ]) }}
+
+    - name: Hand the result to the workflow
+      ansible.builtin.set_stats:
+        data:
+          lab_migrated: "{{ _outcomes | selectattr('ok') | map(attribute='vm') | list }}"
+          lab_not_migrated: "{{ _outcomes | rejectattr('ok') | map(attribute='vm') | list }}"
+        per_host: false
+
+    - name: Every VM must have migrated
+      ansible.builtin.assert:
+        that:
+          - _plan_state == 'Succeeded'
+          - _outcomes | rejectattr('ok') | list | length == 0
+        fail_msg: >-
+          Plan {{ _plan_name }} ended as {{ _plan_state }}.
+          Not migrated: {{ _outcomes | rejectattr('ok') | map(attribute='vm') | join(', ') or 'none' }}.
+          Open the plan in the MTV console for the failed step.
+        quiet: true

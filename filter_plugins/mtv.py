@@ -635,6 +635,101 @@ def mtv_plan_vm_outcomes(plans):
     return out
 
 
+def mtv_lab_outcomes(plan):
+    """Per-VM migration outcome for one Plan, with the VM name resolved and
+    the name of the VM that MTV created. VMs that never started are listed too."""
+    plan = plan or {}
+    spec = plan.get("spec") or {}
+    by_id = {v.get("id"): v.get("name") for v in spec.get("vms") or [] if v.get("id") and v.get("name")}
+    outs = mtv_plan_vm_outcomes([plan]) if plan.get("metadata") else []
+    seen = set()
+    for o in outs:
+        vid = (o.get("facts") or {}).get("id")
+        if vid and (o["vm"] == vid or not o["vm"]) and by_id.get(vid):
+            o["vm"] = by_id[vid]
+        seen.update({o["vm"], vid})
+    for v in spec.get("vms") or []:
+        if v.get("name") in seen or v.get("id") in seen:
+            continue
+        name = v.get("name") or v.get("id")
+        outs.append({"vm": name, "ok": False,
+                     "checks": [_check("migrated", "MTV migration succeeded", "fail", "the migration did not start for this VM")],
+                     "facts": {"plan": (plan.get("metadata") or {}).get("name"), "id": v.get("id"), "new_name": ""}})
+    for o in outs:
+        o["target_name"] = (o["facts"].get("new_name") or mtv_dns(o["vm"], 63))
+    return outs
+
+
+def mtv_lab_match(outcomes, vms):
+    """Attach the VirtualMachine MTV created (by vmID label, else by name)."""
+    out = []
+    for o in outcomes or []:
+        vid = (o.get("facts") or {}).get("id")
+        found = None
+        for vm in vms or []:
+            meta = vm.get("metadata") or {}
+            if vid and (meta.get("labels") or {}).get("vmID") == vid:
+                found = vm
+                break
+        if not found:
+            for vm in vms or []:
+                if (vm.get("metadata") or {}).get("name") == o.get("target_name"):
+                    found = vm
+                    break
+        item = dict(o)
+        item["target"] = ({"name": found["metadata"]["name"], "namespace": found["metadata"].get("namespace", ""),
+                           # older KubeVirt VMs carry spec.running, newer ones spec.runStrategy
+                           "uses_running": "running" in (found.get("spec") or {})}
+                          if found else None)
+        out.append(item)
+    return out
+
+
+def mtv_lab_target(outcome, vmi_result=None):
+    """Checks for the migrated VM on OpenShift, from its VirtualMachineInstance."""
+    tgt = outcome.get("target")
+    res = ((vmi_result or {}).get("resources") or [])
+    st = (res[0].get("status") or {}) if res else {}
+    phase = st.get("phase") or ("not started" if tgt else "-")
+    ips = []
+    for i in st.get("interfaces") or []:
+        for ip in i.get("ipAddresses") or ([i["ipAddress"]] if i.get("ipAddress") else []):
+            if ip and ":" not in ip and ip not in ips:
+                ips.append(ip)
+    agent = any(c.get("type") == "AgentConnected" and c.get("status") == "True" for c in st.get("conditions") or [])
+    if not outcome.get("ok"):
+        checks = [_check("found", "Target VM found in OpenShift", "info", "not checked: the migration did not succeed")]
+    elif not tgt:
+        checks = [_check("found", "Target VM found in OpenShift", "fail", "no VirtualMachine named %s" % outcome.get("target_name"))]
+    else:
+        checks = [
+            _check("found", "Target VM found in OpenShift", "pass", "%s/%s" % (tgt["namespace"], tgt["name"])),
+            _check("running", "VM started on OpenShift Virtualization", "pass" if phase == "Running" else "warn",
+                   "phase %s%s" % (phase, (" on node %s" % st["nodeName"]) if st.get("nodeName") else "")),
+            _check("ips", "IP addresses", "info", ", ".join(ips) or "none reported yet"),
+            _check("agent", "Guest agent", "info", "connected" if agent else "not connected"),
+        ]
+    return {"vm": outcome["vm"], "checks": checks, "phase": phase, "ips": ips,
+            "facts": {"name": (tgt or {}).get("name", ""), "namespace": (tgt or {}).get("namespace", ""),
+                      "phase": phase, "ips": ips, "node": st.get("nodeName", "")}}
+
+
+def mtv_lab_line(outcome, target):
+    """One summary line per VM."""
+    mig = "migrated" if outcome.get("ok") else "NOT migrated (%s)" % next(
+        (c["detail"] for c in outcome.get("checks") or [] if c["id"] == "migrated"), "unknown")
+    if not outcome.get("ok"):
+        return "%s: %s" % (outcome["vm"], mig)
+    tgt = outcome.get("target")
+    where = ("%s/%s, %s%s" % (tgt["namespace"], tgt["name"], target.get("phase"),
+                              (", IP " + ", ".join(target["ips"])) if target.get("ips") else "")) if tgt else "target VM not found"
+    return "%s: %s -> %s" % (outcome["vm"], mig, where)
+
+
+def mtv_lab_pair_line(pair):
+    return mtv_lab_line(pair[0], pair[1])
+
+
 def mtv_ref(planned):
     """MTV ref for a planned VM entry, used in Migration.spec.cancel."""
     ref = {"name": planned["vm"]}
@@ -680,6 +775,11 @@ class FilterModule(object):
             "mtv_plan_vm_outcomes": mtv_plan_vm_outcomes,
             "mtv_cm_vms": mtv_cm_vms,
             "mtv_ref": mtv_ref,
+            "mtv_lab_outcomes": mtv_lab_outcomes,
+            "mtv_lab_match": mtv_lab_match,
+            "mtv_lab_target": mtv_lab_target,
+            "mtv_lab_line": mtv_lab_line,
+            "mtv_lab_pair_line": mtv_lab_pair_line,
             "mtv_report_row": mtv_report_row,
             "mtv_nm_profile": mtv_nm_profile,
             "mtv_clevis_tpm2": mtv_clevis_tpm2,
