@@ -1,0 +1,32 @@
+---
+- name: Inspect VMware provider inventory
+  hosts: localhost
+  gather_facts: false
+
+  collections:
+    - kubernetes.core
+
+  tasks:
+
+    - name: Get VMware Provider
+      kubernetes.core.k8s_info:
+        api_version: forklift.konveyor.io/v1beta1
+        kind: Provider
+        name: vmware
+        namespace: openshift-mtv
+      register: vmware_provider
+
+    - name: Show VMware Provider
+      ansible.builtin.debug:
+        var: vmware_provider.resources[0]
+
+    - name: Get Inventory CRs
+      kubernetes.core.k8s_info:
+        api_version: forklift.konveyor.io/v1beta1
+        kind: Inventory
+        namespace: openshift-mtv
+      register: inventories
+
+    - name: Show Inventories
+      ansible.builtin.debug:
+        var: inventories.resources
