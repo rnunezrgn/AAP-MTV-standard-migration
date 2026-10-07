@@ -1,0 +1,287 @@
+---
+# One-step migration for the lab: creates the NetworkMap, StorageMap and Plan
+# in MTV and starts the migration. Drop-in replacement for the lab playbook
+# (rhpds/ocp-virt playbook.yml): same survey variable names, same result.
+#
+# It asks vCenter nothing. Networks, datastores and VMs are given to MTV by
+# name and MTV resolves them with its own provider, so it does not depend on
+# what the AAP vCenter account is allowed to list.
+#
+# Needs only the OpenShift credential. In the workflow it runs after node 04,
+# which passes user_selected_vm_names. It replaces nodes 06, 07, 08 and 09.
+- name: "Lab | Create the MTV plan and start the migration"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Same names as the lab survey
+    provider_name: vmware
+    plan_name: migration-plan
+    storagemap_name: storagemap
+    networkmap_name: networkmap
+    migration_namespace: openshift-mtv
+    migration_target_namespace: "{{ mtv_target_namespace | default('openshift-mtv') }}"
+    # VM names, one per line or comma separated (node 04 sets this)
+    user_selected_vm_names: ""
+    # Name of an existing Plan whose NetworkMap and StorageMap should be reused
+    # (for example the one built in the MTV console). Empty: create new maps.
+    # The existing Plan itself is only read, never changed.
+    maps_from_plan: ""
+    # Only used when new maps are created: what the VMs sit on in vCenter
+    source_network: segment-migrating-to-ocpvirt
+    source_datastores: [workloadshare]
+    # Empty: use the cluster's default storage class, as the lab playbook does
+    target_storage_class: "{{ mtv_target_storage_class | default('') }}"
+    # false: return as soon as the migration is started (watch it in the console)
+    wait_for_migration: false
+    migration_wait_minutes: 60
+  tasks:
+    - name: Work out the VM list
+      ansible.builtin.set_fact:
+        _vms: >-
+          {{ (_names if _names is not string else
+              (_names | regex_findall('[^,\n\r]+')))
+             | map('trim') | reject('equalto', '') | unique | list }}
+        _datastores: >-
+          {{ (source_datastores if source_datastores is not string else
+              (source_datastores | regex_findall('[^,\n\r]+')))
+             | map('trim') | reject('equalto', '') | unique | list }}
+      vars:
+        _names: "{{ user_selected_vm_names if user_selected_vm_names | length > 0 else (migration_vms | default([])) }}"
+
+    - name: At least one VM is needed
+      ansible.builtin.assert:
+        that: _vms | length > 0 and _datastores | length > 0
+        fail_msg: >-
+          No VM names were given. Set user_selected_vm_names (one name per line), or run this
+          after node 04 in the workflow.
+        quiet: true
+
+    - name: Read the Plan whose maps are reused
+      kubernetes.core.k8s_info:
+        api_version: forklift.konveyor.io/v1beta1
+        kind: Plan
+        namespace: "{{ migration_namespace }}"
+        name: "{{ maps_from_plan }}"
+      register: _src_plan
+      when: maps_from_plan | length > 0
+
+    - name: That Plan must exist and must not be the one being created
+      ansible.builtin.assert:
+        that:
+          - _src_plan.resources | length == 1
+          - maps_from_plan != plan_name
+        fail_msg: >-
+          {{ 'plan_name and maps_from_plan are both ' ~ plan_name ~ '. Give the new plan its own plan_name so the existing one is left untouched.'
+             if maps_from_plan == plan_name else
+             'Plan ' ~ maps_from_plan ~ ' was not found in ' ~ migration_namespace ~ '.' }}
+        quiet: true
+      when: maps_from_plan | length > 0
+
+    - name: Decide which maps the new Plan uses
+      ansible.builtin.set_fact:
+        _reuse: "{{ maps_from_plan | length > 0 }}"
+        _net_map: "{{ _src_plan.resources[0].spec.map.network.name if maps_from_plan | length > 0 else networkmap_name }}"
+        _sto_map: "{{ _src_plan.resources[0].spec.map.storage.name if maps_from_plan | length > 0 else storagemap_name }}"
+
+    - name: Find the cluster's default storage class
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+      register: _scs
+      when: not _reuse and target_storage_class | length == 0
+
+    - name: Choose the target storage class
+      ansible.builtin.set_fact:
+        _sc: "{{ target_storage_class }}"
+
+    - name: Use the default storage class when none was given
+      ansible.builtin.set_fact:
+        _sc: "{{ item.metadata.name }}"
+      loop: "{{ _scs.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when:
+        - not _reuse
+        - target_storage_class | length == 0
+        - (item.metadata.annotations | default({}))['storageclass.kubernetes.io/is-default-class'] | default('false') == 'true'
+
+    - name: A target storage class is needed
+      ansible.builtin.assert:
+        that: _sc | length > 0
+        fail_msg: "The cluster has no default storage class. Set target_storage_class."
+        quiet: true
+      when: not _reuse
+
+    # MTV finds a VM by name. When the reused Plan already lists the VM, its
+    # id is passed along too, which removes any doubt about which VM is meant.
+    - name: Build the VM list for the Plan
+      ansible.builtin.set_fact:
+        _vm_refs: >-
+          {{ _vm_refs | default([])
+             + [({'id': _known[item], 'name': item} if (item in _known and _known[item]) else {'name': item})] }}
+      loop: "{{ _vms }}"
+      vars:
+        _src_vms: "{{ (_src_plan.resources[0].spec.vms | default([])) if _reuse else [] }}"
+        _known: >-
+          {{ dict(_src_vms | selectattr('name', 'defined') | map(attribute='name')
+                  | zip(_src_vms | selectattr('name', 'defined') | map(attribute='id', default=''))) }}
+
+    - name: Build the storage mapping
+      ansible.builtin.set_fact:
+        _storage_map: "{{ _storage_map | default([]) + [{'source': {'name': item}, 'destination': {'storageClass': _sc}}] }}"
+      loop: "{{ _datastores }}"
+      when: not _reuse
+
+    - name: Show what will be migrated
+      ansible.builtin.debug:
+        msg:
+          - "Plan {{ plan_name }} in {{ migration_namespace }}: {{ _vms | join(', ') }} -> namespace {{ migration_target_namespace }}"
+          - "VMs as given to MTV: {{ _vm_refs }}"
+          - "{{ 'Reusing the maps of plan ' ~ maps_from_plan ~ ': network map ' ~ _net_map ~ ', storage map ' ~ _sto_map
+                if _reuse else
+                'New maps: network ' ~ source_network ~ ' -> pod network, datastores ' ~ (_datastores | join(', ')) ~ ' -> ' ~ _sc }}"
+
+    - name: Make sure the target namespace exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ migration_target_namespace }}"
+
+    - name: Create or update the NetworkMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: forklift.konveyor.io/v1beta1
+          kind: NetworkMap
+          metadata:
+            name: "{{ networkmap_name }}"
+            namespace: "{{ migration_namespace }}"
+          spec:
+            map:
+              - source: { name: "{{ source_network }}" }
+                destination: { type: pod }
+            provider:
+              source: { name: "{{ provider_name }}", namespace: "{{ migration_namespace }}" }
+              destination: { name: host, namespace: "{{ migration_namespace }}" }
+      when: not _reuse
+
+    - name: Create or update the StorageMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: forklift.konveyor.io/v1beta1
+          kind: StorageMap
+          metadata:
+            name: "{{ storagemap_name }}"
+            namespace: "{{ migration_namespace }}"
+          spec:
+            map: "{{ _storage_map }}"
+            provider:
+              source: { name: "{{ provider_name }}", namespace: "{{ migration_namespace }}" }
+              destination: { name: host, namespace: "{{ migration_namespace }}" }
+      when: not _reuse
+
+    - name: Create or update the Plan
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: forklift.konveyor.io/v1beta1
+          kind: Plan
+          metadata:
+            name: "{{ plan_name }}"
+            namespace: "{{ migration_namespace }}"
+          spec:
+            archived: false
+            description: "Created by AAP"
+            warm: false
+            targetNamespace: "{{ migration_target_namespace }}"
+            map:
+              network: { name: "{{ _net_map }}", namespace: "{{ migration_namespace }}" }
+              storage: { name: "{{ _sto_map }}", namespace: "{{ migration_namespace }}" }
+            provider:
+              source: { name: "{{ provider_name }}", namespace: "{{ migration_namespace }}" }
+              destination: { name: host, namespace: "{{ migration_namespace }}" }
+            vms: "{{ _vm_refs }}"
+
+    # Stops when the Plan is Ready, or when MTV keeps a Critical condition on it
+    # for a minute (waiting longer would not change that).
+    - name: Wait for MTV to validate the Plan
+      kubernetes.core.k8s_info:
+        api_version: forklift.konveyor.io/v1beta1
+        kind: Plan
+        namespace: "{{ migration_namespace }}"
+        name: "{{ plan_name }}"
+      register: _plan
+      until: >-
+        _plan.resources | length > 0 and
+        ((_plan.resources[0].status.conditions | default([])
+          | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length > 0)
+         or ((_plan.attempts | default(1) | int) >= 6 and
+             (_plan.resources[0].status.conditions | default([])
+              | selectattr('category', 'defined') | selectattr('category', 'equalto', 'Critical')
+              | selectattr('status', 'equalto', 'True') | list | length > 0)))
+      retries: 30
+      delay: 10
+      failed_when: false
+
+    - name: The Plan must be Ready
+      ansible.builtin.assert:
+        that: >-
+          _plan.resources[0].status.conditions | default([])
+          | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length > 0
+        fail_msg: >-
+          Plan {{ plan_name }} is not Ready. MTV says:
+          {{ _plan.resources[0].status.conditions | default([]) | rejectattr('type', 'equalto', 'Ready')
+             | map(attribute='message') | join(' | ') or 'nothing yet' }}
+        quiet: true
+
+    - name: Start the migration
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: forklift.konveyor.io/v1beta1
+          kind: Migration
+          metadata:
+            name: "{{ plan_name }}"
+            namespace: "{{ migration_namespace }}"
+          spec:
+            plan: { name: "{{ plan_name }}", namespace: "{{ migration_namespace }}" }
+
+    - name: Wait for the migration to finish
+      kubernetes.core.k8s_info:
+        api_version: forklift.konveyor.io/v1beta1
+        kind: Plan
+        namespace: "{{ migration_namespace }}"
+        name: "{{ plan_name }}"
+      register: _done
+      until: >-
+        _done.resources[0].status.conditions | default([])
+        | selectattr('type', 'in', ['Succeeded', 'Failed', 'Canceled'])
+        | selectattr('status', 'equalto', 'True') | list | length > 0
+      retries: "{{ (migration_wait_minutes | int) * 3 }}"
+      delay: 20
+      when: wait_for_migration | bool
+
+    - name: The migration must have succeeded
+      ansible.builtin.assert:
+        that: >-
+          _done.resources[0].status.conditions | selectattr('type', 'equalto', 'Succeeded')
+          | selectattr('status', 'equalto', 'True') | list | length > 0
+        fail_msg: "Plan {{ plan_name }} did not succeed. Open it in the MTV console for the failed step."
+        quiet: true
+      when: wait_for_migration | bool
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Migration {{ 'finished' if wait_for_migration | bool else 'started' }} for {{ _vms | join(', ') }}.
+          Follow it in the OpenShift console: Migration > Plans for virtualization > {{ plan_name }}.
+
+    - name: Hand the plan name to later workflow nodes
+      ansible.builtin.set_stats:
+        data:
+          mtv_plan_names: ["{{ plan_name }}"]
+        per_host: false
