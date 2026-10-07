@@ -198,18 +198,21 @@
         url: "{{ api }}job_templates/?playbook={{ migrate_playbook | urlencode }}&order_by=-modified"
       register: _mig_lookup
 
+    # Related fields (project, inventory, execution environment) are sent as
+    # numbers, and left out when the 01 template has none set.
     - name: Settings for the migration template
       ansible.builtin.set_fact:
-        _mig_body:
-          name: "{{ _mig_lookup.json.results[0].name if _mig_lookup.json.count | int > 0 else migrate_template_name }}"
-          description: "Creates the MTV plan and starts the migration (set up by aap_setup.yml)"
-          job_type: run
-          project: "{{ stage_jts[0].project }}"
-          inventory: "{{ stage_jts[0].inventory }}"
-          execution_environment: "{{ stage_jts[0].execution_environment }}"
-          playbook: "{{ migrate_playbook }}"
-          ask_variables_on_launch: true
-          extra_vars: "{{ ({'migration_vms': default_vms} | combine(_migrate_only)) | to_nice_yaml }}"
+        _mig_body: >-
+          {{ {'name': (_mig_lookup.json.results[0].name if _mig_lookup.json.count | int > 0 else migrate_template_name),
+              'description': 'Creates the MTV plan and starts the migration (set up by aap_setup.yml)',
+              'job_type': 'run',
+              'project': stage_jts[0].project | int,
+              'playbook': migrate_playbook,
+              'ask_variables_on_launch': true,
+              'extra_vars': ({'migration_vms': default_vms} | combine(_migrate_only)) | to_nice_yaml}
+             | combine({'inventory': stage_jts[0].inventory | int} if stage_jts[0].inventory else {})
+             | combine({'execution_environment': stage_jts[0].execution_environment | int}
+                       if stage_jts[0].execution_environment else {}) }}
       vars:
         _migrate_keys: [plan_name, unique_names, networkmap_name, storagemap_name, migration_target_namespace,
                         target_storage_class, source_network, source_datastores]
@@ -242,7 +245,7 @@
       ansible.builtin.uri:
         url: "{{ api }}job_templates/{{ _mig.json.id }}/credentials/"
         method: POST
-        body: { id: "{{ item.id | int }}" }
+        body: "{{ {'id': item.id | int} }}"
         status_code: [204, 200, 201]
       loop: "{{ migrate_creds }}"
       loop_control:
@@ -271,13 +274,13 @@
 
     - name: Settings for the workflow
       ansible.builtin.set_fact:
-        _wf_body:
-          name: "{{ workflow_name }}"
-          description: "Discover, decide, readiness, pre-check report, approval, migrate (set up by aap_setup.yml)"
-          organization: "{{ stage_jts[0].organization }}"
-          extra_vars: "{{ workflow_vars | to_nice_yaml }}"
-          survey_enabled: true
-          allow_simultaneous: false
+        _wf_body: >-
+          {{ {'name': workflow_name,
+              'description': 'Discover, decide, readiness, pre-check report, approval, migrate (set up by aap_setup.yml)',
+              'extra_vars': workflow_vars | to_nice_yaml,
+              'survey_enabled': true,
+              'allow_simultaneous': false}
+             | combine({'organization': stage_jts[0].organization | int} if stage_jts[0].organization else {}) }}
 
     - name: Create the workflow
       ansible.builtin.uri:
@@ -333,9 +336,7 @@
       ansible.builtin.uri:
         url: "{{ api }}workflow_job_templates/{{ wf_id }}/workflow_nodes/"
         method: POST
-        body:
-          unified_job_template: "{{ item.1.id | int }}"
-          identifier: "{{ item.0.key }}"
+        body: "{{ {'unified_job_template': item.1.id | int, 'identifier': item.0.key} }}"
         status_code: [201]
       loop: "{{ stage_playbooks | zip(stage_jts) | list }}"
       loop_control:
@@ -364,9 +365,7 @@
       ansible.builtin.uri:
         url: "{{ api }}workflow_job_templates/{{ wf_id }}/workflow_nodes/"
         method: POST
-        body:
-          unified_job_template: "{{ _mig.json.id | int }}"
-          identifier: migrate
+        body: "{{ {'unified_job_template': _mig.json.id | int, 'identifier': 'migrate'} }}"
         status_code: [201]
       register: _migrate_node
 
@@ -378,7 +377,7 @@
       ansible.builtin.uri:
         url: "{{ api }}workflow_job_template_nodes/{{ item.0 }}/success_nodes/"
         method: POST
-        body: { id: "{{ item.1 | int }}" }
+        body: "{{ {'id': item.1 | int} }}"
         status_code: [204, 200, 201]
       loop: "{{ _chain[:-1] | zip(_chain[1:]) | list }}"
       loop_control:
