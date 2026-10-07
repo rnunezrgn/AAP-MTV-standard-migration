@@ -1,0 +1,141 @@
+---
+# Makes sure the VMware provider's VDDK image setting points at an image that
+# exists, because MTV refuses to run a plan while it cannot pull that image
+# ("Unable to Pull VDDK init image").
+#
+#   - the image exists in the cluster's registry  -> keep it, make it pullable
+#   - another VDDK image exists in the registry   -> switch the provider to it
+#   - no VDDK image anywhere in the cluster       -> remove the setting; MTV
+#     then copies the disks without VDDK (slower, cold migrations only), or
+#     with the global VDDK image if the MTV operator has one configured
+#
+# Inputs: provider_name, migration_namespace. Optional: vddk_image (use exactly
+# this image), fix_vddk (false: only report).
+- name: VDDK | Read the source provider
+  kubernetes.core.k8s_info:
+    api_version: forklift.konveyor.io/v1beta1
+    kind: Provider
+    namespace: "{{ migration_namespace }}"
+    name: "{{ provider_name }}"
+  register: _vddk_prov
+
+- name: VDDK | The provider must exist
+  ansible.builtin.assert:
+    that: _vddk_prov.resources | default([]) | length == 1
+    fail_msg: "Provider {{ provider_name }} was not found in {{ migration_namespace }}."
+    quiet: true
+
+- name: VDDK | Look for VDDK images in the cluster registry
+  kubernetes.core.k8s_info:
+    api_version: image.openshift.io/v1
+    kind: ImageStream
+  register: _vddk_streams
+  failed_when: false
+
+- name: VDDK | Work out what to do
+  ansible.builtin.set_fact:
+    _vddk: >-
+      {{ _vddk_prov.resources[0] | mtv_vddk_plan(_vddk_streams.resources | default([]),
+                                               vddk_image | default(''), (fix_vddk | default(true)) | bool) }}
+
+- name: VDDK | Report
+  ansible.builtin.debug:
+    msg:
+      - "Provider {{ provider_name }} VDDK image: {{ _vddk.current or 'not set' }}"
+      - "VDDK images found in the cluster registry: {{ _vddk.candidates | join(', ') or 'none' }}"
+      - "{{ _vddk.message }}"
+
+- name: VDDK | Let every namespace pull the image
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: vddk-image-pullers
+        namespace: "{{ _vddk.pull_namespace }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: system:image-puller
+      subjects:
+        - apiGroup: rbac.authorization.k8s.io
+          kind: Group
+          name: system:serviceaccounts
+  when: _vddk.pull_namespace | length > 0
+  failed_when: false
+
+- name: VDDK | Point the provider at the image that exists
+  kubernetes.core.k8s:
+    state: patched
+    api_version: forklift.konveyor.io/v1beta1
+    kind: Provider
+    namespace: "{{ migration_namespace }}"
+    name: "{{ provider_name }}"
+    merge_type: merge
+    definition:
+      spec:
+        settings:
+          vddkInitImage: "{{ _vddk.set_to }}"
+  when: _vddk.action == 'set'
+
+# Removing a key needs the whole object to be written back without it.
+- name: VDDK | Remove the VDDK image setting from the provider
+  kubernetes.core.k8s:
+    state: present
+    force: true
+    definition: "{{ _vddk.replacement }}"
+  when: _vddk.action == 'remove'
+  register: _vddk_replace
+  failed_when: false
+
+- name: VDDK | Read the provider again
+  kubernetes.core.k8s_info:
+    api_version: forklift.konveyor.io/v1beta1
+    kind: Provider
+    namespace: "{{ migration_namespace }}"
+    name: "{{ provider_name }}"
+  register: _vddk_after
+  when: _vddk.action != 'keep'
+
+- name: VDDK | Second way to remove it, if the first did not take
+  kubernetes.core.k8s:
+    state: patched
+    api_version: forklift.konveyor.io/v1beta1
+    kind: Provider
+    namespace: "{{ migration_namespace }}"
+    name: "{{ provider_name }}"
+    merge_type: merge
+    definition:
+      spec:
+        settings:
+          vddkInitImage: null
+  when:
+    - _vddk.action == 'remove'
+    - (_vddk_after.resources[0].spec.settings | default({})).vddkInitImage is defined
+  failed_when: false
+
+- name: VDDK | Final check
+  kubernetes.core.k8s_info:
+    api_version: forklift.konveyor.io/v1beta1
+    kind: Provider
+    namespace: "{{ migration_namespace }}"
+    name: "{{ provider_name }}"
+  register: _vddk_final
+  when: _vddk.action != 'keep'
+
+- name: VDDK | The change must have taken
+  ansible.builtin.assert:
+    that: >-
+      ((_vddk_final.resources[0].spec.settings | default({})).vddkInitImage | default('')) == _vddk.set_to
+    fail_msg: >-
+      Could not change the VDDK image setting on provider {{ provider_name }}
+      (it is still {{ (_vddk_final.resources[0].spec.settings | default({})).vddkInitImage | default('unset') }},
+      wanted {{ _vddk.set_to or 'unset' }}). Change it in the MTV console: Providers > {{ provider_name }} > edit the VDDK init image.
+    quiet: true
+  when: _vddk.action != 'keep'
+
+- name: VDDK | Give MTV a moment to pick up the provider change
+  ansible.builtin.pause:
+    seconds: 20
+  when: _vddk.action != 'keep'

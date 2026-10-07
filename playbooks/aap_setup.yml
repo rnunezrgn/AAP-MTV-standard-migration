@@ -272,8 +272,7 @@
               'job_type': 'run',
               'project': stage_jts[0].project | int,
               'playbook': post_playbook,
-              'ask_variables_on_launch': true,
-              'extra_vars': '---\n'}
+              'ask_variables_on_launch': true}
              | combine({'inventory': stage_jts[0].inventory | int} if stage_jts[0].inventory else {})
              | combine({'execution_environment': stage_jts[0].execution_environment | int}
                        if stage_jts[0].execution_environment else {}) }}

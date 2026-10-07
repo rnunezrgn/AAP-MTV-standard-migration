@@ -216,4 +216,24 @@ assert mtv.mtv_result(mtv.mtv_lab_target(lm[1], None)["checks"]) == "pass"      
 assert mtv.mtv_lab_pair_line((lm[0], lt)) == mtv.mtv_lab_line(lm[0], lt)
 assert mtv.mtv_lab_line(lm[0], lt) == "database-user1: migrated -> aap-demo-812/db-renamed, Running, IP 10.128.2.9"
 assert "NOT migrated" in mtv.mtv_lab_line(lm[1], mtv.mtv_lab_target(lm[1], None)) and "disk copy failed" in mtv.mtv_lab_line(lm[1], {})
+# VDDK image setting on the provider
+REG = "image-registry.openshift-image-registry.svc:5000"
+pv = {"apiVersion": "forklift.konveyor.io/v1beta1", "kind": "Provider", "metadata": {"name": "vmware", "namespace": "openshift-mtv", "resourceVersion": "9", "uid": "u", "managedFields": [1]},
+      "spec": {"type": "vsphere", "url": "https://vc/sdk", "secret": {"name": "s"}, "settings": {"vddkInitImage": REG + "/openshift/vddk:latest", "sdkEndpoint": "vcenter"}}, "status": {"x": 1}}
+ist = lambda ns, n, tag, has=True: {"metadata": {"namespace": ns, "name": n}, "status": {"tags": [{"tag": tag, "items": [{"image": "sha"}] if has else []}]}}
+v1 = mtv.mtv_vddk_plan(pv, [ist("openshift", "vddk", "latest"), ist("openshift", "cli", "latest")])
+assert v1["action"] == "keep" and v1["pull_namespace"] == "openshift" and v1["candidates"] == ["openshift/vddk:latest"], v1
+v2 = mtv.mtv_vddk_plan(pv, [ist("openshift-mtv", "vddk", "8.0.3"), ist("openshift", "vddk", "latest", has=False)])
+assert v2["action"] == "set" and v2["set_to"] == REG + "/openshift-mtv/vddk:8.0.3" and v2["pull_namespace"] == "openshift-mtv", v2
+v3 = mtv.mtv_vddk_plan(pv, [ist("openshift", "cli", "latest")])
+assert v3["action"] == "remove" and v3["set_to"] == "" and v3["replacement"]["spec"]["settings"] == {"sdkEndpoint": "vcenter"}, v3
+assert v3["replacement"]["metadata"] == {"name": "vmware", "namespace": "openshift-mtv", "resourceVersion": "9"} and "status" not in v3["replacement"] and v3["replacement"]["spec"]["url"] == "https://vc/sdk"
+assert pv["spec"]["settings"]["vddkInitImage"]          # the input is not modified
+assert mtv.mtv_vddk_plan(pv, None)["action"] == "remove"
+v4 = mtv.mtv_vddk_plan(pv, [], fix=False); assert v4["action"] == "keep" and v4["message"].startswith("Would change it")
+pe = json.loads(json.dumps(pv)); pe["spec"]["settings"]["vddkInitImage"] = "quay.io/acme/vddk:8"
+assert mtv.mtv_vddk_plan(pe, [])["action"] == "keep"
+pn = json.loads(json.dumps(pv)); pn["spec"]["settings"].pop("vddkInitImage")
+assert mtv.mtv_vddk_plan(pn, [])["action"] == "keep" and mtv.mtv_vddk_plan(pn, [])["current"] == ""
+v5 = mtv.mtv_vddk_plan(pv, [], wanted="quay.io/acme/vddk:8"); assert v5["action"] == "set" and v5["set_to"] == "quay.io/acme/vddk:8" and v5["pull_namespace"] == ""
 print("ALL FILTER TESTS PASSED")

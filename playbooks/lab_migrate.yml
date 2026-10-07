@@ -35,6 +35,9 @@
     # every run gets fresh names and never collides with an earlier one.
     unique_names: false
     name_suffix: "{{ awx_workflow_job_id | default(awx_job_id | default('')) }}"
+    # true: before creating the plan, make sure the provider's VDDK image
+    # setting points at an image that exists (see tasks/vddk.yml)
+    fix_vddk: true
     # false: return as soon as the migration is started (watch it in the console)
     wait_for_migration: false
     migration_wait_minutes: 60
@@ -43,6 +46,9 @@
       ansible.builtin.set_fact:
         _plan_name: "{{ (plan_name ~ '-' ~ name_suffix) if (unique_names | bool and name_suffix | string | length > 0) else plan_name }}"
         _target_ns: "{{ (migration_target_namespace ~ '-' ~ name_suffix) if (unique_names | bool and name_suffix | string | length > 0) else migration_target_namespace }}"
+
+    - name: Check the provider's VDDK image
+      ansible.builtin.include_tasks: tasks/vddk.yml
 
     - name: Work out the VM list
       ansible.builtin.set_fact:
@@ -158,6 +164,22 @@
           kind: Namespace
           metadata:
             name: "{{ _target_ns }}"
+
+    # A new namespace gets its registry pull secret a moment after it is
+    # created. MTV's VDDK check pulls an image in this namespace, so wait for it.
+    - name: Wait for the namespace to be ready to pull images
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ServiceAccount
+        namespace: "{{ _target_ns }}"
+        name: default
+      register: _default_sa
+      until: >-
+        _default_sa.resources | default([]) | length > 0 and
+        (_default_sa.resources[0].imagePullSecrets | default([]) | length > 0)
+      retries: 6
+      delay: 5
+      failed_when: false
 
     - name: Create or update the NetworkMap
       kubernetes.core.k8s:

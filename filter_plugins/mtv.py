@@ -730,6 +730,69 @@ def mtv_lab_pair_line(pair):
     return mtv_lab_line(pair[0], pair[1])
 
 
+INTERNAL_REGISTRY = "image-registry.openshift-image-registry.svc:5000"
+
+
+def mtv_vddk_plan(provider, imagestreams=None, wanted="", fix=True):
+    """Decide what to do with a vSphere provider's vddkInitImage setting.
+
+    Returns {current, candidates, action: keep|set|remove, set_to, pull_namespace,
+    message, replacement}. `replacement` is the provider object without the
+    setting, for a full replace.
+    """
+    provider = provider or {}
+    settings = dict((provider.get("spec") or {}).get("settings") or {})
+    current = settings.get("vddkInitImage", "") or ""
+    tags = {}       # "ns/name:tag" -> True for every tag that holds an image
+    for i in imagestreams or []:
+        meta = i.get("metadata") or {}
+        for t in (i.get("status") or {}).get("tags") or []:
+            if t.get("items"):
+                tags["%s/%s:%s" % (meta.get("namespace"), meta.get("name"), t.get("tag"))] = True
+    candidates = sorted(k for k in tags if "vddk" in k.lower())
+
+    def internal_ref(image):
+        m = re.match(r"^" + re.escape(INTERNAL_REGISTRY) + r"/([^/]+)/([^:@]+)(?::([^@]+))?$", image or "")
+        return ("%s/%s:%s" % (m.group(1), m.group(2), m.group(3) or "latest")) if m else None
+
+    out = {"current": current, "candidates": candidates, "action": "keep", "set_to": current,
+           "pull_namespace": "", "replacement": {}}
+    cur_ref = internal_ref(current)
+    if wanted:
+        out.update(action="keep" if wanted == current else "set", set_to=wanted,
+                   message="Using the VDDK image given in vddk_image.")
+        ref = internal_ref(wanted)
+        if ref:
+            out["pull_namespace"] = ref.split("/")[0]
+    elif not current:
+        out["message"] = ("No VDDK image is set on the provider: MTV uses its global VDDK image if one is "
+                          "configured, otherwise it copies the disks without VDDK.")
+    elif cur_ref is None:
+        out["message"] = "The VDDK image is in an external registry; it cannot be checked from here and is left as it is."
+    elif cur_ref in tags:
+        out.update(pull_namespace=cur_ref.split("/")[0],
+                   message="The VDDK image exists in the cluster registry; made sure every namespace may pull it.")
+    elif candidates:
+        best = candidates[0]
+        out.update(action="set", set_to="%s/%s" % (INTERNAL_REGISTRY, best), pull_namespace=best.split("/")[0],
+                   message="The configured VDDK image does not exist in the cluster registry. Switching the provider to %s." % best)
+    else:
+        out.update(action="remove", set_to="",
+                   message="The configured VDDK image does not exist, and the cluster registry has no VDDK image at all. "
+                           "Removing the setting so MTV can migrate without it (slower disk copy).")
+    if not fix and out["action"] != "keep":
+        out.update(action="keep", message="Would change it (fix_vddk is false): " + out["message"])
+    if out["action"] == "remove":
+        settings.pop("vddkInitImage", None)
+        meta = provider.get("metadata") or {}
+        spec = dict(provider.get("spec") or {})
+        spec["settings"] = settings
+        keep = {k: meta[k] for k in ("name", "namespace", "labels", "annotations", "resourceVersion", "finalizers") if meta.get(k)}
+        out["replacement"] = {"apiVersion": provider.get("apiVersion", "forklift.konveyor.io/v1beta1"),
+                              "kind": "Provider", "metadata": keep, "spec": spec}
+    return out
+
+
 def mtv_ref(planned):
     """MTV ref for a planned VM entry, used in Migration.spec.cancel."""
     ref = {"name": planned["vm"]}
@@ -779,6 +842,7 @@ class FilterModule(object):
             "mtv_lab_match": mtv_lab_match,
             "mtv_lab_target": mtv_lab_target,
             "mtv_lab_line": mtv_lab_line,
+            "mtv_vddk_plan": mtv_vddk_plan,
             "mtv_lab_pair_line": mtv_lab_pair_line,
             "mtv_report_row": mtv_report_row,
             "mtv_nm_profile": mtv_nm_profile,
