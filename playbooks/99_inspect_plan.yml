@@ -1,0 +1,21 @@
+---
+- name: Inspect MTV migration Plan
+  hosts: localhost
+  gather_facts: false
+
+  collections:
+    - kubernetes.core
+
+  tasks:
+
+    - name: Get migration Plan
+      kubernetes.core.k8s_info:
+        api_version: forklift.konveyor.io/v1beta1
+        kind: Plan
+        name: move-webapp-vmware
+        namespace: openshift-mtv
+      register: plan
+
+    - name: Show Plan
+      ansible.builtin.debug:
+        var: plan.resources[0]
