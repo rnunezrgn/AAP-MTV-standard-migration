@@ -1,0 +1,48 @@
+---
+- name: Diagnose MTV StorageMap
+  hosts: localhost
+  gather_facts: false
+
+  collections:
+    - kubernetes.core
+
+  tasks:
+
+    - name: Get failing StorageMap
+      kubernetes.core.k8s_info:
+        api_version: forklift.konveyor.io/v1beta1
+        kind: StorageMap
+        name: vmware-gbdxv
+        namespace: openshift-mtv
+      register: storagemap
+
+    - name: Get StorageClasses
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+      register: storageclasses
+
+    - name: Get MTV Providers
+      kubernetes.core.k8s_info:
+        api_version: forklift.konveyor.io/v1beta1
+        kind: Provider
+        namespace: openshift-mtv
+      register: providers
+
+    - name: Show StorageMap
+      ansible.builtin.debug:
+        var: storagemap.resources
+
+    - name: Show StorageClasses
+      ansible.builtin.debug:
+        msg: "{{ storageclasses.resources
+          | map(attribute='metadata.name')
+          | list }}"
+
+    - name: Show Providers
+      ansible.builtin.debug:
+        msg:
+          name: "{{ item.metadata.name }}"
+          type: "{{ item.spec.type | default('undefined') }}"
+          url: "{{ item.spec.url | default('undefined') }}"
+      loop: "{{ providers.resources }}"
