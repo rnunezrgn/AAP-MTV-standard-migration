@@ -1,0 +1,395 @@
+---
+# Sets up the demo in AAP through the controller API, so nothing has to be
+# clicked together by hand:
+#   1. finds your existing job templates for nodes 01 to 04 (by playbook path)
+#   2. syncs the project and checks that playbooks/lab_migrate.yml is in it
+#   3. creates or updates the job template "MTV | Lab migrate"
+#   4. creates or rebuilds the workflow "MTV | Demo workflow":
+#      01 Discover > 02 Decide > 03 Readiness > 04 Pre-check report >
+#      approval > Lab migrate
+#
+# It does not launch anything and does not touch any other template or
+# workflow. Safe to run again: it updates what it created.
+#
+# Run it as a job template with a "Red Hat Ansible Automation Platform"
+# credential (controller URL, user, password), or from a shell with
+# CONTROLLER_HOST / CONTROLLER_USERNAME / CONTROLLER_PASSWORD set.
+- name: Set up the MTV demo workflow in AAP
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # ---- connection (from the AAP credential) -----------------------------
+    controller_host: "{{ lookup('env', 'CONTROLLER_HOST') or lookup('env', 'AAP_HOSTNAME') or lookup('env', 'TOWER_HOST') }}"
+    controller_username: "{{ lookup('env', 'CONTROLLER_USERNAME') or lookup('env', 'AAP_USERNAME') or lookup('env', 'TOWER_USERNAME') }}"
+    controller_password: "{{ lookup('env', 'CONTROLLER_PASSWORD') or lookup('env', 'AAP_PASSWORD') or lookup('env', 'TOWER_PASSWORD') }}"
+    controller_token: "{{ lookup('env', 'CONTROLLER_OAUTH_TOKEN') or lookup('env', 'AAP_TOKEN') or lookup('env', 'TOWER_OAUTH_TOKEN') }}"
+    controller_validate_certs: false
+
+    # ---- names of what this playbook creates -------------------------------
+    migrate_template_name: "MTV | Lab migrate"
+    workflow_name: "MTV | Demo workflow"
+    approval_name: "Approve the migration"
+
+    # ---- lab values ---------------------------------------------------------
+    default_vms: database-user1
+    # Passed to every node of the workflow.
+    workflow_vars:
+      # nodes 01 to 04
+      migration_mode: cold
+      mtv_guest_checks: false
+      vcenter_datacenter: RS00
+      mtv_source_provider: vmware
+      network_mappings:
+        - { source: segment-migrating-to-ocpvirt, type: pod }
+        - { source: "*", type: pod }
+      # Lab migrate
+      plan_name: aap-demo
+      unique_names: true
+      networkmap_name: aap-networkmap
+      storagemap_name: aap-storagemap
+      migration_target_namespace: aap-demo
+      target_storage_class: ocs-external-storagecluster-ceph-rbd
+      source_network: segment-migrating-to-ocpvirt
+      source_datastores: [workloadshare]
+
+    # ---- the workflow, in order --------------------------------------------
+    stage_playbooks:
+      - { key: discover, playbook: playbooks/01_discover.yml }
+      - { key: decide, playbook: playbooks/02_decide.yml }
+      - { key: readiness, playbook: playbooks/03_readiness.yml }
+      - { key: precheck, playbook: playbooks/04_precheck_report.yml }
+    migrate_playbook: playbooks/lab_migrate.yml
+
+  module_defaults:
+    ansible.builtin.uri:
+      url_username: "{{ omit if controller_token else controller_username }}"
+      url_password: "{{ omit if controller_token else controller_password }}"
+      force_basic_auth: "{{ not (controller_token | length > 0) }}"
+      headers: "{{ {'Authorization': 'Bearer ' ~ controller_token} if controller_token else {} }}"
+      validate_certs: "{{ controller_validate_certs }}"
+      body_format: json
+      return_content: true
+      timeout: 60
+
+  tasks:
+    # ------------------------------------------------------------------ API
+    - name: The controller address and a login are needed
+      ansible.builtin.assert:
+        that:
+          - controller_host | length > 0
+          - (controller_token | length > 0) or (controller_username | length > 0 and controller_password | length > 0)
+        fail_msg: >-
+          No controller login was passed to this job. Attach a credential of type
+          "Red Hat Ansible Automation Platform" to this job template.
+        quiet: true
+
+    - name: Find the controller API
+      ansible.builtin.uri:
+        url: "{{ _host }}{{ item }}ping/"
+        status_code: [200, 301, 302, 401, 403, 404]
+      loop: ["/api/controller/v2/", "/api/v2/"]
+      register: _ping
+      vars:
+        _host: "{{ ('https://' ~ controller_host) if '://' not in controller_host else controller_host | regex_replace('/+$', '') }}"
+
+    - name: Remember the API address
+      ansible.builtin.set_fact:
+        api: >-
+          {{ (('https://' ~ controller_host) if '://' not in controller_host else controller_host | regex_replace('/+$', ''))
+             ~ (_ping.results | selectattr('status', 'equalto', 200) | map(attribute='item') | first | default('')) }}
+        _api_found: "{{ _ping.results | selectattr('status', 'equalto', 200) | list | length > 0 }}"
+
+    - name: The controller API must answer
+      ansible.builtin.assert:
+        that: _api_found
+        fail_msg: >-
+          Could not reach the controller API at {{ controller_host }}
+          (answers: {{ _ping.results | map(attribute='status') | join(', ') }}).
+          Check the URL in the AAP credential.
+        quiet: true
+
+    # ------------------------------------------- existing templates 01 to 04
+    - name: Find your job templates for nodes 01 to 04
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/?playbook={{ item.playbook | urlencode }}&order_by=-modified"
+      loop: "{{ stage_playbooks }}"
+      loop_control:
+        label: "{{ item.playbook }}"
+      register: _stage_lookup
+
+    - name: Every one of them must exist
+      ansible.builtin.assert:
+        that: item.json.count | int > 0
+        fail_msg: >-
+          No job template uses {{ item.item.playbook }}. Create it first (or fix its Playbook field),
+          then run this again.
+        quiet: true
+      loop: "{{ _stage_lookup.results }}"
+      loop_control:
+        label: "{{ item.item.playbook }}"
+
+    - name: Keep them
+      ansible.builtin.set_fact:
+        stage_jts: "{{ _stage_lookup.results | map(attribute='json.results') | map('first') | list }}"
+
+    - name: Show which templates are used
+      ansible.builtin.debug:
+        msg: "{{ stage_playbooks | map(attribute='playbook') | zip(stage_jts | map(attribute='name')) | map('join', '  ->  ') | list }}"
+
+    # ------------------------------------------------------------- project
+    - name: Sync the project
+      ansible.builtin.uri:
+        url: "{{ api }}projects/{{ stage_jts[0].project }}/update/"
+        method: POST
+        body: {}
+        status_code: [200, 201, 202]
+      register: _sync
+
+    - name: Wait for the sync
+      ansible.builtin.uri:
+        url: "{{ api }}project_updates/{{ _sync.json.id | default(_sync.json.project_update) }}/"
+      register: _sync_state
+      until: _sync_state.json.status in ['successful', 'failed', 'error', 'canceled']
+      retries: 60
+      delay: 5
+
+    - name: The sync must succeed
+      ansible.builtin.assert:
+        that: _sync_state.json.status == 'successful'
+        fail_msg: "The project sync ended as {{ _sync_state.json.status }}. Open the project in AAP and check its last sync."
+        quiet: true
+
+    - name: Read the playbooks in the project
+      ansible.builtin.uri:
+        url: "{{ api }}projects/{{ stage_jts[0].project }}/playbooks/"
+      register: _playbooks
+
+    - name: The migration playbook must be in the project
+      ansible.builtin.assert:
+        that: migrate_playbook in _playbooks.json
+        fail_msg: >-
+          {{ migrate_playbook }} is not in the project. Commit and push it to the repository
+          this project uses, then run this again.
+        quiet: true
+
+    # ------------------------------------- OpenShift credential for migrate
+    - name: Pick the OpenShift credential from the 04 template
+      ansible.builtin.set_fact:
+        _k8s_creds: >-
+          {{ stage_jts[3].summary_fields.credentials | default([])
+             | selectattr('kind', 'equalto', 'kubernetes_bearer_token') | list }}
+        _all_creds_04: "{{ stage_jts[3].summary_fields.credentials | default([]) }}"
+
+    - name: Decide which credentials the migration template gets
+      ansible.builtin.set_fact:
+        migrate_creds: "{{ _k8s_creds if _k8s_creds | length > 0 else _all_creds_04 }}"
+
+    - name: An OpenShift credential is needed
+      ansible.builtin.assert:
+        that: migrate_creds | length > 0
+        fail_msg: >-
+          The template {{ stage_jts[3].name }} has no credential attached, so there is nothing to copy.
+          Attach your OpenShift credential to it and run this again.
+        quiet: true
+
+    # ------------------------------------------------ the migration template
+    - name: Look for an existing migration template
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/?playbook={{ migrate_playbook | urlencode }}&order_by=-modified"
+      register: _mig_lookup
+
+    - name: Settings for the migration template
+      ansible.builtin.set_fact:
+        _mig_body:
+          name: "{{ _mig_lookup.json.results[0].name if _mig_lookup.json.count | int > 0 else migrate_template_name }}"
+          description: "Creates the MTV plan and starts the migration (set up by aap_setup.yml)"
+          job_type: run
+          project: "{{ stage_jts[0].project }}"
+          inventory: "{{ stage_jts[0].inventory }}"
+          execution_environment: "{{ stage_jts[0].execution_environment }}"
+          playbook: "{{ migrate_playbook }}"
+          ask_variables_on_launch: true
+          extra_vars: "{{ ({'migration_vms': default_vms} | combine(_migrate_only)) | to_nice_yaml }}"
+      vars:
+        _migrate_keys: [plan_name, unique_names, networkmap_name, storagemap_name, migration_target_namespace,
+                        target_storage_class, source_network, source_datastores]
+        _migrate_only: "{{ workflow_vars | dict2items | selectattr('key', 'in', _migrate_keys) | items2dict }}"
+
+    - name: Create the migration template
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/"
+        method: POST
+        body: "{{ _mig_body }}"
+        status_code: [201]
+      register: _mig_created
+      when: _mig_lookup.json.count | int == 0
+
+    - name: Update the migration template
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/{{ _mig_lookup.json.results[0].id }}/"
+        method: PATCH
+        body: "{{ _mig_body }}"
+        status_code: [200]
+      register: _mig_updated
+      when: _mig_lookup.json.count | int > 0
+
+    - name: Read the migration template back
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/{{ _mig_created.json.id if _mig_lookup.json.count | int == 0 else _mig_lookup.json.results[0].id }}/"
+      register: _mig
+
+    - name: Attach the OpenShift credential to it
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/{{ _mig.json.id }}/credentials/"
+        method: POST
+        body: { id: "{{ item.id | int }}" }
+        status_code: [204, 200, 201]
+      loop: "{{ migrate_creds }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - item.id not in (_mig.json.summary_fields.credentials | default([]) | map(attribute='id') | list)
+        - item.kind not in (_mig.json.summary_fields.credentials | default([]) | map(attribute='kind') | list)
+
+    # --------------------- nodes 01 to 04 must accept the workflow's variables
+    - name: Let the 01 to 04 templates take variables from the workflow
+      ansible.builtin.uri:
+        url: "{{ api }}job_templates/{{ item.id }}/"
+        method: PATCH
+        body: { ask_variables_on_launch: true }
+        status_code: [200]
+      loop: "{{ stage_jts }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: not item.ask_variables_on_launch
+
+    # ---------------------------------------------------------- the workflow
+    - name: Look for the workflow
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/?name={{ workflow_name | urlencode }}"
+      register: _wf_lookup
+
+    - name: Settings for the workflow
+      ansible.builtin.set_fact:
+        _wf_body:
+          name: "{{ workflow_name }}"
+          description: "Discover, decide, readiness, pre-check report, approval, migrate (set up by aap_setup.yml)"
+          organization: "{{ stage_jts[0].organization }}"
+          extra_vars: "{{ workflow_vars | to_nice_yaml }}"
+          survey_enabled: true
+          allow_simultaneous: false
+
+    - name: Create the workflow
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/"
+        method: POST
+        body: "{{ _wf_body | combine({'survey_enabled': false}) }}"
+        status_code: [201]
+      register: _wf_created
+      when: _wf_lookup.json.count | int == 0
+
+    - name: Remember the workflow id
+      ansible.builtin.set_fact:
+        wf_id: "{{ _wf_created.json.id if _wf_lookup.json.count | int == 0 else _wf_lookup.json.results[0].id }}"
+
+    - name: Set the survey (which VMs to migrate)
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/{{ wf_id }}/survey_spec/"
+        method: POST
+        body:
+          name: Migration run
+          description: VMs for this run
+          spec:
+            - question_name: VMs to migrate
+              question_description: vCenter VM names, one per line
+              variable: migration_vms
+              type: textarea
+              required: true
+              default: "{{ default_vms }}"
+        status_code: [200, 201, 204]
+
+    - name: Update the workflow settings
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/{{ wf_id }}/"
+        method: PATCH
+        body: "{{ _wf_body }}"
+        status_code: [200]
+
+    - name: Read the workflow's current nodes
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/{{ wf_id }}/workflow_nodes/?page_size=200"
+      register: _old_nodes
+
+    - name: Remove them (the workflow is rebuilt from scratch)
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_template_nodes/{{ item.id }}/"
+        method: DELETE
+        status_code: [204, 404]
+      loop: "{{ _old_nodes.json.results }}"
+      loop_control:
+        label: "{{ item.identifier | default(item.id) }}"
+
+    - name: Add nodes 01 to 04
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/{{ wf_id }}/workflow_nodes/"
+        method: POST
+        body:
+          unified_job_template: "{{ item.1.id | int }}"
+          identifier: "{{ item.0.key }}"
+        status_code: [201]
+      loop: "{{ stage_playbooks | zip(stage_jts) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      register: _stage_nodes
+
+    - name: Add the approval node
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/{{ wf_id }}/workflow_nodes/"
+        method: POST
+        body: { identifier: approval }
+        status_code: [201]
+      register: _approval_node
+
+    - name: Make it an approval
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_template_nodes/{{ _approval_node.json.id }}/create_approval_template/"
+        method: POST
+        body:
+          name: "{{ approval_name }}"
+          description: "Read the pre-check report from node 04, then approve to start the migration"
+          timeout: 0
+        status_code: [200, 201]
+
+    - name: Add the migration node
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_templates/{{ wf_id }}/workflow_nodes/"
+        method: POST
+        body:
+          unified_job_template: "{{ _mig.json.id | int }}"
+          identifier: migrate
+        status_code: [201]
+      register: _migrate_node
+
+    - name: Put the nodes in order
+      ansible.builtin.set_fact:
+        _chain: "{{ (_stage_nodes.results | map(attribute='json.id') | list) + [_approval_node.json.id, _migrate_node.json.id] }}"
+
+    - name: Link each node to the next one (on success)
+      ansible.builtin.uri:
+        url: "{{ api }}workflow_job_template_nodes/{{ item.0 }}/success_nodes/"
+        method: POST
+        body: { id: "{{ item.1 | int }}" }
+        status_code: [204, 200, 201]
+      loop: "{{ _chain[:-1] | zip(_chain[1:]) | list }}"
+      loop_control:
+        label: "{{ item.0 }} -> {{ item.1 }}"
+
+    # ---------------------------------------------------------------- done
+    - name: Done
+      ansible.builtin.debug:
+        msg:
+          - "Workflow ready: {{ workflow_name }}"
+          - "Order: {{ (stage_jts | map(attribute='name') | list + [approval_name, _mig.json.name]) | join('  >  ') }}"
+          - "Migration template: {{ _mig.json.name }} ({{ migrate_playbook }}), credential: {{ migrate_creds | map(attribute='name') | join(', ') }}"
+          - "To run the demo: Templates > {{ workflow_name }} > Launch, enter the VM names, approve when asked."
+          - "Each run creates plan aap-demo-<run number> in namespace aap-demo-<run number>, so it can be launched again without cleanup."

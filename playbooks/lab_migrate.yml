@@ -31,10 +31,19 @@
     source_datastores: [workloadshare]
     # Empty: use the cluster's default storage class, as the lab playbook does
     target_storage_class: "{{ mtv_target_storage_class | default('') }}"
+    # true: add the AAP job number to the plan name and the target namespace, so
+    # every run gets fresh names and never collides with an earlier one.
+    unique_names: false
+    name_suffix: "{{ awx_workflow_job_id | default(awx_job_id | default('')) }}"
     # false: return as soon as the migration is started (watch it in the console)
     wait_for_migration: false
     migration_wait_minutes: 60
   tasks:
+    - name: Settle the plan name and the target namespace
+      ansible.builtin.set_fact:
+        _plan_name: "{{ (plan_name ~ '-' ~ name_suffix) if (unique_names | bool and name_suffix | string | length > 0) else plan_name }}"
+        _target_ns: "{{ (migration_target_namespace ~ '-' ~ name_suffix) if (unique_names | bool and name_suffix | string | length > 0) else migration_target_namespace }}"
+
     - name: Work out the VM list
       ansible.builtin.set_fact:
         _vms: >-
@@ -69,10 +78,10 @@
       ansible.builtin.assert:
         that:
           - _src_plan.resources | length == 1
-          - maps_from_plan != plan_name
+          - maps_from_plan != _plan_name
         fail_msg: >-
-          {{ 'plan_name and maps_from_plan are both ' ~ plan_name ~ '. Give the new plan its own plan_name so the existing one is left untouched.'
-             if maps_from_plan == plan_name else
+          {{ 'plan_name and maps_from_plan are both ' ~ _plan_name ~ '. Give the new plan its own plan_name so the existing one is left untouched.'
+             if maps_from_plan == _plan_name else
              'Plan ' ~ maps_from_plan ~ ' was not found in ' ~ migration_namespace ~ '.' }}
         quiet: true
       when: maps_from_plan | length > 0
@@ -135,7 +144,7 @@
     - name: Show what will be migrated
       ansible.builtin.debug:
         msg:
-          - "Plan {{ plan_name }} in {{ migration_namespace }}: {{ _vms | join(', ') }} -> namespace {{ migration_target_namespace }}"
+          - "Plan {{ _plan_name }} in {{ migration_namespace }}: {{ _vms | join(', ') }} -> namespace {{ _target_ns }}"
           - "VMs as given to MTV: {{ _vm_refs }}"
           - "{{ 'Reusing the maps of plan ' ~ maps_from_plan ~ ': network map ' ~ _net_map ~ ', storage map ' ~ _sto_map
                 if _reuse else
@@ -148,7 +157,7 @@
           apiVersion: v1
           kind: Namespace
           metadata:
-            name: "{{ migration_target_namespace }}"
+            name: "{{ _target_ns }}"
 
     - name: Create or update the NetworkMap
       kubernetes.core.k8s:
@@ -191,13 +200,13 @@
           apiVersion: forklift.konveyor.io/v1beta1
           kind: Plan
           metadata:
-            name: "{{ plan_name }}"
+            name: "{{ _plan_name }}"
             namespace: "{{ migration_namespace }}"
           spec:
             archived: false
             description: "Created by AAP"
             warm: false
-            targetNamespace: "{{ migration_target_namespace }}"
+            targetNamespace: "{{ _target_ns }}"
             map:
               network: { name: "{{ _net_map }}", namespace: "{{ migration_namespace }}" }
               storage: { name: "{{ _sto_map }}", namespace: "{{ migration_namespace }}" }
@@ -213,7 +222,7 @@
         api_version: forklift.konveyor.io/v1beta1
         kind: Plan
         namespace: "{{ migration_namespace }}"
-        name: "{{ plan_name }}"
+        name: "{{ _plan_name }}"
       register: _plan
       until: >-
         _plan.resources | length > 0 and
@@ -233,7 +242,7 @@
           _plan.resources[0].status.conditions | default([])
           | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length > 0
         fail_msg: >-
-          Plan {{ plan_name }} is not Ready. MTV says:
+          Plan {{ _plan_name }} is not Ready. MTV says:
           {{ _plan.resources[0].status.conditions | default([]) | rejectattr('type', 'equalto', 'Ready')
              | map(attribute='message') | join(' | ') or 'nothing yet' }}
         quiet: true
@@ -245,17 +254,17 @@
           apiVersion: forklift.konveyor.io/v1beta1
           kind: Migration
           metadata:
-            name: "{{ plan_name }}"
+            name: "{{ _plan_name }}"
             namespace: "{{ migration_namespace }}"
           spec:
-            plan: { name: "{{ plan_name }}", namespace: "{{ migration_namespace }}" }
+            plan: { name: "{{ _plan_name }}", namespace: "{{ migration_namespace }}" }
 
     - name: Wait for the migration to finish
       kubernetes.core.k8s_info:
         api_version: forklift.konveyor.io/v1beta1
         kind: Plan
         namespace: "{{ migration_namespace }}"
-        name: "{{ plan_name }}"
+        name: "{{ _plan_name }}"
       register: _done
       until: >-
         _done.resources[0].status.conditions | default([])
@@ -270,7 +279,7 @@
         that: >-
           _done.resources[0].status.conditions | selectattr('type', 'equalto', 'Succeeded')
           | selectattr('status', 'equalto', 'True') | list | length > 0
-        fail_msg: "Plan {{ plan_name }} did not succeed. Open it in the MTV console for the failed step."
+        fail_msg: "Plan {{ _plan_name }} did not succeed. Open it in the MTV console for the failed step."
         quiet: true
       when: wait_for_migration | bool
 
@@ -278,10 +287,10 @@
       ansible.builtin.debug:
         msg: >-
           Migration {{ 'finished' if wait_for_migration | bool else 'started' }} for {{ _vms | join(', ') }}.
-          Follow it in the OpenShift console: Migration > Plans for virtualization > {{ plan_name }}.
+          Follow it in the OpenShift console: Migration > Plans for virtualization > {{ _plan_name }}.
 
     - name: Hand the plan name to later workflow nodes
       ansible.builtin.set_stats:
         data:
-          mtv_plan_names: ["{{ plan_name }}"]
+          mtv_plan_names: ["{{ _plan_name }}"]
         per_host: false
